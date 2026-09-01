@@ -1,0 +1,40 @@
+# Python cache and local build output
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+*.tmp
+
+# Local credentials, account state and configuration
+accounts/
+config*.json
+config*.yaml
+config*.yml
+config*.toml
+.env
+.env.*
+*.key
+*.token
+*.pem
+
+# User-provided materials and task snapshots
+lq.txt
+lq_ids.txt
+grab_*.json
+
+# Local-only binaries and reverse-engineering tools
+Publish.apk
+jadx-1.5.6/
+
+# The repository being published here is the standalone Python client.
+grab_platform/
+grabber_node_go/
+
+# macOS metadata
+.DS_Store
