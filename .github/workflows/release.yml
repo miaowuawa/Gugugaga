@@ -1,0 +1,123 @@
+name: Build and release executables
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (留空则自动使用 v0.0.<run_number>)"
+        required: false
+        type: string
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: qigumi_grabber
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+            artifact_name: QigumiGrabber-linux
+            binary_name: QigumiGrabber-linux
+            artifact_path: qigumi_grabber/dist/QigumiGrabber-linux
+            hidden_imports: ""
+          - platform: macos
+            os: macos-latest
+            artifact_name: QigumiGrabber-macos
+            binary_name: QigumiGrabber-macos
+            artifact_path: qigumi_grabber/dist/QigumiGrabber-macos
+            hidden_imports: ""
+          - platform: windows
+            os: windows-latest
+            artifact_name: QigumiGrabber-windows
+            binary_name: QigumiGrabber-windows
+            artifact_path: qigumi_grabber/dist/QigumiGrabber-windows.exe
+            hidden_imports: "--hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          path: qigumi_grabber
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install --upgrade pyinstaller
+
+      - name: Build executable
+        shell: bash
+        run: >-
+          python -m PyInstaller --noconfirm --clean --onefile --console
+          --name ${{ matrix.binary_name }} --paths ".."
+          --hidden-import qigumi_grabber.grab_window
+          --hidden-import qigumi_grabber.alipay
+          --hidden-import qigumi_grabber.serverchan
+          --hidden-import qigumi_grabber.proxy
+          --hidden-import qigumi_grabber.notify
+          ${{ matrix.hidden_imports }} __main__.py
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: QigumiGrabber-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Set release tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            release_tag="${{ inputs.release_tag }}"
+            if [ -z "$release_tag" ]; then
+              release_tag="v0.0.${{ github.run_number }}"
+            fi
+          else
+            release_tag="${{ github.ref_name }}"
+          fi
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --target "${{ github.sha }}" \
+              --title "QigumiGrabber $RELEASE_TAG" \
+              --generate-notes
+          fi
