@@ -148,6 +148,14 @@ def main():
                 n.stop()
     print(f"最终状态: {snap['status']}")
     print(f"消息: {snap['msg']}")
+    if snap["status"] == "failed":
+        diagnostics = [
+            log.get("body") for log in snap.get("logs", [])
+            if log.get("stage") == "answerDiagnosis" and log.get("body")
+        ]
+        if diagnostics:
+            # 即使重试结束得很快，也在最终结果中保留最后一次答题失败诊断。
+            print(diagnostics[-1])
     if snap.get("order_code"):
         print(f"订单号: {snap['order_code']}")
     if snap.get("pay_info"):

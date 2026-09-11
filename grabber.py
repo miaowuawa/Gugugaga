@@ -107,13 +107,9 @@ class GrabTask:
             target_ts = p.get("target_ts") or 0
             if target_ts > time.time():
                 self._set(status="waiting", msg="等待开抢时间")
-                while time.time() < target_ts:
-                    if self._stop.is_set():
-                        self._set(status="stopped", msg="已停止（等待阶段）")
-                        return
-                    remaining = target_ts - time.time()
-                    self._set(msg=f"距开抢 {int(remaining)} 秒")
-                    time.sleep(min(0.2, max(0.05, remaining)))
+                if self._wait_until_target(target_ts):
+                    self._set(status="stopped", msg="已停止（等待阶段）")
+                    return
 
             if self._stop.is_set():
                 self._set(status="stopped", msg="已停止")
@@ -267,6 +263,34 @@ class GrabTask:
             time.sleep(min(0.05, end - time.time()))
         return False
 
+    def _wait_until_target(self, target_ts: float) -> bool:
+        """等待到 Unix 时间戳；返回 True 表示被停止。
+
+        先用墙上时钟将目标时间换算成单调时钟的 deadline，避免等待途中
+        因系统自动校时而跳变。最后约 2ms 不再强制 sleep，以避免旧逻辑
+        在剩余不足 50ms 时仍睡满 50ms 造成的额外延迟。
+        """
+        remaining = target_ts - time.time()
+        if remaining <= 0:
+            return False
+        deadline = time.monotonic() + remaining
+        while True:
+            if self._stop.is_set():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # 最后 2ms 忙等一次；时间很短，能避免 sleep 的额外调度延迟。
+            if remaining <= 0.002:
+                continue
+            self._set(msg=f"距开抢 {int(remaining)} 秒")
+            if remaining > 0.05:
+                # 保留 20ms 余量进入精确等待阶段，同时保持停止操作的响应性。
+                time.sleep(min(0.2, remaining - 0.02))
+            else:
+                # 先睡到 deadline 前约 2ms，避免占用 CPU 等待较长时间。
+                time.sleep(remaining - 0.002)
+
     @staticmethod
     def _jittered(base_secs: float) -> float:
         return max(0.0, base_secs + random.uniform(-JITTER_MS, JITTER_MS) / 1000.0)
@@ -364,7 +388,13 @@ class GrabTask:
             body = chk.get("body") or {}
             if body.get("answer_result") is True:
                 return True, "答题通过"
-            self._log("checkAnswer", None, "答题未通过: " + str(body.get("answer_result_detail") or ""))
+            result_detail = str(body.get("answer_result_detail") or "")
+            diagnostic = format_answer_diagnostic(questions, ds["answers"])
+            failure_msg = "答题未通过" + (f": {result_detail}" if result_detail else "")
+            # 失败诊断只包含本次题目和提交的答案，不包含答题材料或 API Key。
+            self._log("answerDiagnosis", None, failure_msg, body=diagnostic)
+            # 抢票窗口会实时输出任务消息；在重试前显示诊断，便于核对题目、选项与选择。
+            self._set(msg=f"{failure_msg}\n{diagnostic}")
             if self._sleep(0.5):
                 return False, "已停止"
         return False, f"答题重试 {MAX_ANSWER_RETRIES} 次均未通过"
@@ -597,7 +627,8 @@ class GrabTask:
 
 # ---------- 解析辅助 ----------
 
-def _normalize_questions(raw_questions: list) -> list:
+def normalize_questions(raw_questions: list) -> list:
+    """将 answerList 的原始题目整理成统一的题目/选项结构。"""
     out = []
     for q in raw_questions:
         if not isinstance(q, dict):
@@ -611,6 +642,32 @@ def _normalize_questions(raw_questions: list) -> list:
             ],
         })
     return out
+
+
+def format_answer_diagnostic(questions: list, answers: list) -> str:
+    """格式化答题失败诊断：题干、全部选项和实际提交的答案。"""
+    selected_by_question = {
+        answer.get("question_id"): answer.get("answer_id")
+        for answer in answers if isinstance(answer, dict)
+    }
+    lines = ["【答题失败诊断】"]
+    for index, question in enumerate(questions, 1):
+        question_id = question.get("question_id")
+        selected_id = selected_by_question.get(question_id)
+        lines.append(f"第 {index} 题（question_id={question_id}）：{question.get('question_name') or '（题干为空）'}")
+        selected_text = "（未找到提交答案）"
+        for option_index, option in enumerate(question.get("options") or [], 1):
+            answer_id = option.get("answer_id")
+            answer_name = option.get("answer_name") or "（选项为空）"
+            lines.append(f"  {option_index}. {answer_name}（answer_id={answer_id}）")
+            if answer_id == selected_id:
+                selected_text = f"{option_index}. {answer_name}（answer_id={answer_id}）"
+        lines.append(f"  已选：{selected_text}")
+    return "\n".join(lines)
+
+
+# 兼容可能从旧名称导入此内部辅助方法的外部脚本。
+_normalize_questions = normalize_questions
 
 
 def _extract_order_code(body) -> str:
