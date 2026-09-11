@@ -151,3 +151,7 @@ python -m compileall -q qigumi_grabber
 2.自动支付等涉及资金交易流程的功能
 3.刷抢优惠，批量抢购，批量注册等黑灰产功能
 4.获取未授权数据，无视平台限制发起请求
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=miaowuawa/Gugugaga&type=Date)](https://www.star-history.com/#miaowuawa/Gugugaga&Date)
