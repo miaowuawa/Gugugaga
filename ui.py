@@ -1039,7 +1039,6 @@ def _launch_grab_window(mgr: AccountManager, acc, params: dict):
         console.print(f"[dim]可手动运行: {manual}[/dim]")
         return
     console.print("[green]抢票窗口已启动[/green]")
-    time.sleep(1)
 
 
 # ===================================================================

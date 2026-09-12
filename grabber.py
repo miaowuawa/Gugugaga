@@ -23,6 +23,7 @@ MAX_ANSWER_RETRIES = 3
 DEFAULT_REFRESH_DELAY_MS = 500
 DEFAULT_ORDER_DELAY_MS = 500
 JITTER_MS = 100
+WAIT_SPIN_NS = 5_000_000  # 最后 5ms 忙等，避免 sleep 调度延迟
 # 连续出现"频繁"且 code=400 超过该次数时判定 IP 被限速，换 IP
 FREQUENT_LIMIT = 2
 
@@ -267,29 +268,26 @@ class GrabTask:
         """等待到 Unix 时间戳；返回 True 表示被停止。
 
         先用墙上时钟将目标时间换算成单调时钟的 deadline，避免等待途中
-        因系统自动校时而跳变。最后约 2ms 不再强制 sleep，以避免旧逻辑
-        在剩余不足 50ms 时仍睡满 50ms 造成的额外延迟。
+        因系统自动校时而跳变。最后 5ms 不再调用 sleep，以避免操作系统
+        调度造成额外延迟。
         """
         remaining = target_ts - time.time()
         if remaining <= 0:
             return False
-        deadline = time.monotonic() + remaining
+        deadline_ns = time.monotonic_ns() + int(remaining * 1_000_000_000)
         while True:
             if self._stop.is_set():
                 return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
                 return False
-            # 最后 2ms 忙等一次；时间很短，能避免 sleep 的额外调度延迟。
-            if remaining <= 0.002:
+            # 最后 5ms 忙等；不会再被 sleep 的系统调度粒度拖后。
+            if remaining_ns <= WAIT_SPIN_NS:
                 continue
+            remaining = remaining_ns / 1_000_000_000
             self._set(msg=f"距开抢 {int(remaining)} 秒")
-            if remaining > 0.05:
-                # 保留 20ms 余量进入精确等待阶段，同时保持停止操作的响应性。
-                time.sleep(min(0.2, remaining - 0.02))
-            else:
-                # 先睡到 deadline 前约 2ms，避免占用 CPU 等待较长时间。
-                time.sleep(remaining - 0.002)
+            # 长时间等待时分段唤醒，临近目标时提前 5ms 进入忙等。
+            time.sleep(min(0.2, remaining - WAIT_SPIN_NS / 1_000_000_000))
 
     @staticmethod
     def _jittered(base_secs: float) -> float:
