@@ -126,11 +126,13 @@ def _test_proxy():
     pm = ProxyManager(_cfg)
     if not pm.is_configured():
         console.print("[red]未配置代理提取链接，请先设置[/red]")
+        Prompt.ask("按回车返回设置", default="")
         return
     console.print("[dim]正在提取代理...[/dim]")
     result = pm.extract()
     if not result["ok"]:
         console.print(f"[red]{result['msg']}[/red]")
+        Prompt.ask("按回车返回设置", default="")
         return
     p = result["proxy"]
     console.print(f"[green]提取成功: {p['ip']}:{p['port']}  城市={p.get('city')}  剩余={p.get('remain')}s[/green]")
@@ -146,6 +148,7 @@ def _test_proxy():
         console.print(f"[{style}]代理测试: {t['msg']}[/]")
     else:
         console.print(f"[red]代理不可用: {t['msg']}[/red]")
+    Prompt.ask("按回车返回设置", default="")
 
 
 def _input_phone() -> str:
