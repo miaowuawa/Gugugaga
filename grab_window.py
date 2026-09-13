@@ -121,10 +121,11 @@ def main():
             except Exception as e:
                 print(f"[打开浏览器失败: {e}]")
 
-        # Server酱³ 手机通知：SendKey 从全局配置读取，不写入任务参数文件
-        if params.get("serverchan_enabled"):
+        # Server酱³ 是全局通知：设置了 SendKey 的所有成功任务都会推送。
+        # 不再为单独任务保存一个开关，避免配置文件间出现不一致。
+        from qigumi_grabber.config import Config
+        if Config().get("serverchan_sendkey", "").strip():
             try:
-                from qigumi_grabber.config import Config
                 from qigumi_grabber.serverchan import send
                 sendkey = Config().get("serverchan_sendkey", "").strip()
                 if not sendkey:

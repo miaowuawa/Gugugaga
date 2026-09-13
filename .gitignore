@@ -10,9 +10,12 @@ venv/
 .ruff_cache/
 *.log
 *.tmp
+build/
+dist/
 
 # Local credentials, account state and configuration
 accounts/
+task_configs/
 config*.json
 config*.yaml
 config*.yml

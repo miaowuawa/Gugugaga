@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -16,12 +17,14 @@ from rich.panel import Panel
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
-from qigumi_grabber.account import AccountManager, DEVICE_PHONE, DEVICE_TABLET
-from qigumi_grabber.client import parse_resp
+from qigumi_grabber.account import AccountManager, DEVICE_PHONE, DEVICE_TABLET, random_device
+from qigumi_grabber.client import QiGuMiClient, parse_resp
 from qigumi_grabber.config import Config
+from qigumi_grabber.task_config import TaskConfigManager
 from qigumi_grabber.goods import (GOODS_TYPE_COMMON, GOODS_TYPE_TICKET, GOODS_TYPE_VOUCHER,
                                  GOODS_TYPE_WRITE_OFF, classify_goods, extract_goods_info,
                                  extract_reservation_options)
+from qigumi_grabber.grabber import normalize_questions
 from qigumi_grabber.notify import MODE_AUDIO, MODE_BEEP, MODE_NONE, MODE_TTS, MODE_NAMES
 
 console = Console()
@@ -30,6 +33,7 @@ PHONE_RE = re.compile(r"^1\d{10}$")
 GOODS_URL_RE = re.compile(r"goods_id=(\d+)")
 
 _cfg = Config()
+_task_configs = TaskConfigManager()
 
 
 def _clear_page():
@@ -191,13 +195,67 @@ def _input_goods_id() -> int:
         console.print("[red]无法识别 goods_id，请粘贴分享链接或直接输入数字 ID[/red]")
 
 
+def _pause(message: str = "按回车继续"):
+    """在即将返回会清屏的菜单前保留提示信息。"""
+    Prompt.ask(message, default="")
+
+
+def menu_test_fetch_questions(mgr: AccountManager):
+    """按商品 ID 直接调用 answerList，仅用于查看接口返回的题目。"""
+    _clear_page()
+    acc = _pick_account(mgr)
+    if acc is None:
+        return
+    goods_id = _input_goods_id()
+    console.print(Panel.fit(
+        f"[bold cyan]测试拉题 — 商品 {goods_id}[/bold cyan]\n"
+        "[dim]直接请求 answerList，不检查商品详情、答题开关或答题时机；不会提交答案。[/dim]",
+        border_style="cyan"))
+    console.print("[dim]正在拉取题目...[/dim]")
+    try:
+        resp = acc.get_client().get_answer_list(goods_id)
+        result = parse_resp(resp)
+    except Exception as e:
+        console.print(f"[red]拉取失败: {e}[/red]")
+        Prompt.ask("按回车返回主菜单", default="")
+        return
+
+    if not result["ok"]:
+        if acc.is_token_invalid(result):
+            console.print(f"[red]登录已失效: {result.get('msg')}[/red]")
+            console.print("[yellow]请重新登录后再试[/yellow]")
+        else:
+            console.print(f"[red]拉取失败: code={result.get('code')} msg={result.get('msg')}[/red]")
+        Prompt.ask("按回车返回主菜单", default="")
+        return
+
+    questions = normalize_questions((result.get("body") or {}).get("question_list") or [])
+    if not questions:
+        console.print("[yellow]接口请求成功，但未返回题目。[/yellow]")
+        Prompt.ask("按回车返回主菜单", default="")
+        return
+
+    console.print(f"[green]已拉取 {len(questions)} 道题目[/green]")
+    for index, question in enumerate(questions, 1):
+        table = Table(title=f"第 {index} 题  question_id={question.get('question_id')}")
+        table.add_column("#", justify="right", width=4)
+        table.add_column("选项内容")
+        table.add_column("answer_id")
+        for option_index, option in enumerate(question["options"], 1):
+            table.add_row(str(option_index), str(option.get("answer_name") or ""),
+                          str(option.get("answer_id") or ""))
+        console.print(f"[bold]{question.get('question_name') or '（题干为空）'}[/bold]")
+        console.print(table)
+    Prompt.ask("按回车返回主菜单", default="")
+
+
 # ===================================================================
 # 账号管理
 # ===================================================================
 
 def menu_accounts(mgr: AccountManager):
     while True:
-        console.clear()
+        _clear_page()
         console.print(Panel.fit("[bold cyan]奇谷米单机抢票器[/bold cyan] — 账号管理",
                                 border_style="cyan"))
         accounts = mgr.list_accounts()
@@ -220,9 +278,10 @@ def menu_accounts(mgr: AccountManager):
                           d.get("nickname") or "-", d.get("uid") or "-")
         console.print(table)
         console.print("[dim]1[/dim] 注册/登录（短信验证码）  [dim]2[/dim] 密码登录  "
-                      "[dim]3[/dim] 检查登录状态  [dim]4[/dim] 购买人管理  "
-                      "[dim]5[/dim] 地址管理  [dim]6[/dim] 删除账号  [dim]0[/dim] 返回")
-        choice = Prompt.ask("选择", choices=["0", "1", "2", "3", "4", "5", "6"], default="0")
+                      "[dim]3[/dim] 检查单个登录状态  [dim]4[/dim] 一键检查全部登录状态\n"
+                      "[dim]5[/dim] 购买人管理  [dim]6[/dim] 地址管理  "
+                      "[dim]7[/dim] 删除账号  [red][dim]8[/dim] 一键清空全部账号[/red]  [dim]0[/dim] 返回")
+        choice = Prompt.ask("选择", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="0")
         if choice == "0":
             return
         if choice == "1":
@@ -232,11 +291,15 @@ def menu_accounts(mgr: AccountManager):
         elif choice == "3":
             _account_check(mgr)
         elif choice == "4":
-            _menu_buyers(mgr)
+            _account_check_all(mgr)
         elif choice == "5":
-            _menu_addresses(mgr)
+            _menu_buyers(mgr)
         elif choice == "6":
+            _menu_addresses(mgr)
+        elif choice == "7":
             _account_delete(mgr)
+        elif choice == "8":
+            _account_clear_all(mgr)
 
 
 def _pick_account(mgr: AccountManager, require_login=True) -> object:
@@ -305,6 +368,44 @@ def _account_check(mgr: AccountManager):
     Prompt.ask("按回车继续", default="")
 
 
+def _account_check_all(mgr: AccountManager):
+    """依次检查全部账号，避免同时请求造成不必要的限流。"""
+    accounts = mgr.list_accounts()
+    if not accounts:
+        console.print("[red]暂无账号，请先注册/登录[/red]")
+        Prompt.ask("按回车继续", default="")
+        return
+
+    _clear_page()
+    console.print(Panel.fit("[bold cyan]一键检查全部登录状态[/bold cyan]", border_style="cyan"))
+    results = []
+    total = len(accounts)
+    for index, acc in enumerate(accounts, 1):
+        console.print(f"[dim]正在检查 {index}/{total}: {acc.phone}...[/dim]")
+        detail = acc.check_status()
+        if detail.startswith("已登录"):
+            state = "[green]已登录[/green]"
+        elif detail == "未登录":
+            state = "[yellow]未登录[/yellow]"
+        elif detail.startswith("登录已失效"):
+            state = "[red]登录已失效[/red]"
+        else:
+            state = "[red]检查异常[/red]"
+        results.append((acc.phone, state, detail))
+
+    table = Table(title=f"检查完成（共 {total} 个账号）")
+    table.add_column("手机号")
+    table.add_column("状态")
+    table.add_column("详情")
+    for phone, state, detail in results:
+        table.add_row(phone, state, detail)
+    console.print(table)
+    logged_in = sum(1 for _, _, detail in results if detail.startswith("已登录"))
+    console.print(f"[bold]汇总：[/bold] [green]{logged_in} 个已登录[/green]，"
+                  f"[yellow]{total - logged_in} 个未登录、失效或检查异常[/yellow]")
+    Prompt.ask("按回车继续", default="")
+
+
 def _account_delete(mgr: AccountManager):
     acc = _pick_account(mgr, require_login=False)
     if acc is None:
@@ -313,6 +414,34 @@ def _account_delete(mgr: AccountManager):
         mgr.remove(acc.phone)
         console.print("[green]已删除[/green]")
     time.sleep(1)
+
+
+def _account_clear_all(mgr: AccountManager):
+    """清空全部账号环境，需精确输入本机当前时间作为二次确认。"""
+    accounts = mgr.list_accounts()
+    if not accounts:
+        console.print("[yellow]暂无账号可清空[/yellow]")
+        _pause()
+        return
+    expected = time.strftime("%Y-%m-%d %H:%M")
+    console.print(Panel.fit(
+        f"[bold red]危险操作：将删除 {len(accounts)} 个账号的本地登录环境[/bold red]\n"
+        "账号 Token、设备指纹和本地账号资料将无法恢复；不会删除任务配置或全局设置。\n"
+        f"请输入当前时间进行确认（精确到分钟）：[bold]{expected}[/bold]",
+        border_style="red"))
+    typed = Prompt.ask("当前时间（YYYY-MM-DD HH:MM）").strip()
+    if typed != expected:
+        console.print("[yellow]时间不匹配，已取消清空账号操作[/yellow]")
+        _pause()
+        return
+    try:
+        removed = mgr.clear_all()
+    except OSError as e:
+        console.print(f"[red]清空账号失败: {e}[/red]")
+        _pause()
+        return
+    console.print(f"[green]已清空 {removed} 个账号环境[/green]")
+    _pause()
 
 
 # ===================================================================
@@ -578,31 +707,27 @@ def _address_del(client, addrs):
 # 新建抢票任务
 # ===================================================================
 
-def menu_grab(mgr: AccountManager):
-    acc = _pick_account(mgr)
-    if acc is None:
-        return
-    console.clear()
-    console.print(Panel.fit(f"[bold cyan]新建抢票任务 — 账号 {acc.phone}[/bold cyan]",
+def menu_create_task_config(_mgr: AccountManager):
+    """创建仅含商品通用参数的任务配置，不绑定任何账号。"""
+    _clear_page()
+    console.print(Panel.fit("[bold cyan]新建任务配置[/bold cyan]\n"
+                            "[dim]此处不选择账号；地址、实名购买人等会在启动时按账号选择。[/dim]",
                             border_style="cyan"))
     goods_id = _input_goods_id()
 
-    # 1. 获取票务信息
+    # 商品详情是公开读取接口。使用临时设备请求，避免创建/绑定任何账号环境。
     console.print("[dim]正在获取商品信息...[/dim]")
-    client = acc.get_client()
+    client = QiGuMiClient(device=random_device())
     try:
         resp = client.get_goods_detail(goods_id)
         r = parse_resp(resp)
     except Exception as e:
         console.print(f"[red]获取商品详情失败: {e}[/red]")
+        _pause()
         return
     if not r["ok"]:
-        if acc.is_token_invalid(r):
-            console.print(f"[red]登录已失效: {r.get('msg')}[/red]")
-            if _relogin(mgr, acc):
-                return menu_grab(mgr)
-            return
         console.print(f"[red]获取商品详情失败: code={r['code']} msg={r['msg']}[/red]")
+        _pause()
         return
     body = r.get("body") or {}
     info = extract_goods_info(body)
@@ -612,10 +737,26 @@ def menu_grab(mgr: AccountManager):
     console.print(f"[bold]类型:[/bold] {gtype}  价格: {info.get('price')}  "
                   f"售卖状态: {info.get('sell_button_status_name')}")
 
-    # 2. 选择 SKU
+    # 2. 选择 SKU。票务 SKU 嵌套在场馆中，必须连同对应 venue_id 一起保存，
+    # 否则下次从配置启动时会出现票档和场次不匹配。
     skus = info.get("sku_list") or []
+    if gtype == GOODS_TYPE_TICKET:
+        ticket_skus = []
+        for venue in info.get("venue_list") or []:
+            for ticket_sku in venue.get("ticket_sku_list") or []:
+                ticket_skus.append({
+                    "sku_id": ticket_sku.get("sku_id"),
+                    "name": ticket_sku.get("name") or "",
+                    "price": ticket_sku.get("price"),
+                    "store": ticket_sku.get("ticket_surplus_store"),
+                    "venue_id": venue.get("venue_id"),
+                    "venue_show_time": venue.get("venue_show_time") or "",
+                })
+        if ticket_skus:
+            skus = ticket_skus
     if not skus:
         console.print("[red]未找到 SKU 列表[/red]")
+        _pause()
         return
     sku_table = Table(title="SKU 列表")
     sku_table.add_column("#", justify="right")
@@ -623,48 +764,48 @@ def menu_grab(mgr: AccountManager):
     sku_table.add_column("名称")
     sku_table.add_column("价格")
     sku_table.add_column("库存")
+    if gtype == GOODS_TYPE_TICKET:
+        sku_table.add_column("场次时间")
     for i, s in enumerate(skus, 1):
-        sku_table.add_row(str(i), str(s.get("sku_id")), s.get("name") or "-",
-                          str(s.get("price") or "-"), str(s.get("store") or "-"))
+        row = [str(i), str(s.get("sku_id")), s.get("name") or "-",
+               str(s.get("price") or "-"), str(s.get("store") or "-")]
+        if gtype == GOODS_TYPE_TICKET:
+            row.append(s.get("venue_show_time") or "-")
+        sku_table.add_row(*row)
     console.print(sku_table)
     sku_idx = IntPrompt.ask("选择 SKU 编号", default=1)
     if sku_idx < 1 or sku_idx > len(skus):
         console.print("[red]SKU 编号无效[/red]")
+        _pause()
         return
-    sku_id = int(skus[sku_idx - 1]["sku_id"])
-    params_sku_name = skus[sku_idx - 1].get("name") or ""
+    selected_sku = skus[sku_idx - 1]
+    sku_id = int(selected_sku["sku_id"])
+    params_sku_name = selected_sku.get("name") or ""
     num = IntPrompt.ask("数量", default=1)
 
-    # 3. 按类型填写信息
+    # 3. 仅填写所有账号共用的商品字段。
     params = {
         "goods_id": goods_id, "sku_id": sku_id, "num": num,
-        "address_id": 0, "store_id": 0, "venue_id": 0,
+        "store_id": 0, "venue_id": int(selected_sku.get("venue_id") or 0),
         "reservation_date": "", "reservation_quantum_id": 0,
-        "buyer_ids": "", "write_off_phone": "",
         "goods_name": info.get("name") or "",
         "sku_name": params_sku_name,
+        "goods_type": gtype,
     }
 
-    if gtype == GOODS_TYPE_COMMON:
-        _fill_address(client, params)
-    elif gtype == GOODS_TYPE_WRITE_OFF:
+    if gtype == GOODS_TYPE_WRITE_OFF:
         _fill_store(client, params, info)
         _fill_reservation(client, params, body)
-        params["write_off_phone"] = Prompt.ask("核销手机号（核销/预约商品必填，默认账号手机号）",
-                                               default=acc.phone).strip()
     elif gtype == GOODS_TYPE_TICKET:
-        _fill_venue(client, params, info)
-        params["write_off_phone"] = Prompt.ask("核销手机号（票务商品必填，默认账号手机号）",
-                                               default=acc.phone).strip()
-    elif gtype == GOODS_TYPE_VOUCHER:
-        params["write_off_phone"] = Prompt.ask("核销手机号（默认账号手机号）",
-                                               default=acc.phone).strip()
+        if not params["venue_id"]:
+            _fill_venue(client, params, info)
+        else:
+            console.print(f"[green]已随票档保存场次：{selected_sku.get('venue_show_time') or params['venue_id']}[/green]")
 
-    # 实名制购买人
+    # 实名制类型是商品属性；实际购买人属于账号，启动时再选。
     reg_type = info.get("ticket_reg_type")
     if reg_type in (1, 2):
         params["_ticket_reg_type"] = reg_type
-        _fill_buyer(client, params, goods_id)
 
     # 4. 抢票参数
     console.print("\n[bold cyan]抢票参数[/bold cyan]")
@@ -675,14 +816,16 @@ def menu_grab(mgr: AccountManager):
                                 default=int(cfg.get("default_order_delay_ms", 500)))
     max_retries = IntPrompt.ask("最大重试次数（0=无限重试，默认 0）",
                                 default=int(cfg.get("default_max_retries", 0)))
-    target = Prompt.ask("开抢时间（留空=立即开始，格式 2026-08-11 20:00:00）").strip()
-    target_ts = 0
-    if target:
-        try:
-            target_ts = time.mktime(time.strptime(target, "%Y-%m-%d %H:%M:%S"))
-        except ValueError:
-            console.print("[red]时间格式错误，将立即开始[/red]")
-            target_ts = 0
+    # 商品详情中的开售时间是创建配置时的权威来源；只有用户明确要改时才手输。
+    target_ts = _sale_start_timestamp(info.get("sell_start_time"))
+    if target_ts:
+        detected = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(target_ts))
+        console.print(f"[green]已自动获取开售时间：{detected}[/green]")
+        if Confirm.ask("修改开抢时间？", default=False):
+            target_ts = _ask_target_timestamp()
+    else:
+        console.print("[yellow]商品详情未返回开售时间，可手动设置[/yellow]")
+        target_ts = _ask_target_timestamp()
 
     # 5. 答题配置
     qcfg = info.get("question_config") or {}
@@ -703,6 +846,7 @@ def menu_grab(mgr: AccountManager):
             answer_mode = "post_auto"
             console.print("[bold]开售后答题：[/bold]")
             if not _ask_answer_config(cfg, params):
+                _pause()
                 return
         elif timing == 1:
             # 售前答题：开售前先答题，通过后等待开抢
@@ -711,6 +855,7 @@ def menu_grab(mgr: AccountManager):
                 answer_mode = "pre_sale"
                 console.print("[bold]售前答题：[/bold]")
                 if not _ask_answer_config(cfg, params):
+                    _pause()
                     return
             else:
                 console.print("[yellow]不处理售前答题，将直接等待开抢后下单（可能因未答题失败）[/yellow]")
@@ -724,14 +869,24 @@ def menu_grab(mgr: AccountManager):
                 answer_mode = "pre_sale"
                 console.print("[bold]开售前答题：[/bold]")
                 if not _ask_answer_config(cfg, params):
+                    _pause()
                     return
             elif choice == "2":
                 answer_mode = "post_auto"
                 console.print("[bold]开售后答题：[/bold]")
                 if not _ask_answer_config(cfg, params):
+                    _pause()
                     return
             else:
                 console.print("[yellow]不处理答题，将直接下单（可能因未答题失败）[/yellow]")
+    elif timing in (1, 2):
+        # 当前账号可能已经答过题；仍允许为另一个账号预先保存材料。
+        when = "开售前" if timing == 1 else "开售后"
+        if Confirm.ask(f"当前账号无需答题；是否为其他账号保存{when}答题材料？", default=False):
+            answer_mode = "pre_sale" if timing == 1 else "post_auto"
+            if not _ask_answer_config(cfg, params):
+                _pause()
+                return
 
     params.update({
         "answer_mode": answer_mode,
@@ -742,8 +897,8 @@ def menu_grab(mgr: AccountManager):
         "pay_type": cfg.get("default_pay_type", "2"),
     })
 
-    # 6. 确认并启动（新窗口）
-    console.print("\n[bold cyan]任务参数确认[/bold cyan]")
+    # 6. 配置中保存提醒和启动偏好；下次只需选配置和账号。
+    console.print("\n[bold cyan]任务配置确认[/bold cyan]")
     proxy_configured = bool(cfg.get("proxy_extract_url"))
     if proxy_configured:
         proxy_mode = Confirm.ask("使用代理？（否=无代理模式直连）", default=True)
@@ -774,61 +929,214 @@ def menu_grab(mgr: AccountManager):
         params["notify_tts"] = Prompt.ask("TTS 朗读文本（默认：抢到了，请尽快支付）",
                                           default="抢到了，请尽快支付").strip()
 
-    # Server酱³ 通知：SendKey 由全局设置统一管理
-    serverchan_configured = bool(cfg.get("serverchan_sendkey", "").strip())
-    if serverchan_configured:
-        params["serverchan_enabled"] = Confirm.ask(
-            "启用 Server酱³ 手机通知？（使用全局 SendKey）", default=False)
-    else:
-        params["serverchan_enabled"] = False
-        console.print("[dim]Server酱³ 未配置全局 SendKey，已跳过手机通知[/dim]")
+    if cfg.get("serverchan_sendkey", "").strip():
+        console.print("[dim]已配置全局 Server酱³：抢到后将自动推送[/dim]")
 
     for k, v in params.items():
         console.print(f"  {k}: {v}")
-    if not Confirm.ask("确认启动抢票？（回车默认不启动）", default=False):
+    default_name = re.sub(r"[\\/:*?\"<>|]+", "_", (info.get("name") or "任务配置"))[:40]
+    name = Prompt.ask("配置文件名称", default=default_name).strip()
+    if not name:
+        console.print("[yellow]已取消[/yellow]")
+        Prompt.ask("按回车返回", default="")
+        return
+    target_path = os.path.join(_task_configs.directory, name + ".json")
+    if os.path.exists(target_path) and not Confirm.ask("同名配置已存在，确认覆盖？", default=False):
         console.print("[yellow]已取消[/yellow]")
         Prompt.ask("按回车返回主菜单", default="")
         return
-    _launch_grab_window(mgr, acc, params)
-    console.print("[green]任务已启动，抢票窗口已打开，可在新窗口查看进度[/green]")
+    try:
+        path = _task_configs.save(name, params)
+        console.print(f"[green]任务配置已保存：{path}[/green]")
+        console.print("[dim]以后从「任务配置」选择此文件，再选择账号即可启动。[/dim]")
+    except OSError as e:
+        console.print(f"[red]保存任务配置失败: {e}[/red]")
     Prompt.ask("按回车返回主菜单", default="")
 
 
 def _ask_answer_config(cfg, params: dict) -> bool:
-    """询问 DeepSeek API Key 与答题材料（粘贴或 txt 文件）。返回是否配置完成。"""
+    """保存答题材料文件位置；实际是否读取由运行时所选账号决定。"""
     api_key = cfg.get("deepseek_api_key", "")
-    if api_key:
-        console.print(f"[dim]已从配置读取 API Key（{api_key[:8]}...）[/dim]")
-        new_key = Prompt.ask("DeepSeek API Key（回车使用已保存的）").strip()
-        if new_key:
-            api_key = new_key
-            cfg.set("deepseek_api_key", api_key)
-    else:
-        api_key = Prompt.ask("DeepSeek API Key").strip()
-        if api_key:
-            cfg.set("deepseek_api_key", api_key)
     if not api_key:
         console.print("[red]API Key 不能为空，请先在「设置」中配置[/red]")
         return False
-    params["deepseek_api_key"] = api_key
+    console.print(f"[dim]将使用全局 API Key（{api_key[:8]}...）[/dim]")
+    while True:
+        path = Prompt.ask("答题材料 txt 文件路径").strip().strip('"').strip("'")
+        if not os.path.isfile(path):
+            console.print("[red]文件不存在，请重试[/red]")
+            continue
+        params["materials_path"] = os.path.abspath(path)
+        console.print(f"[green]已保存答题材料位置：{params['materials_path']}[/green]")
+        return True
 
-    mode = Prompt.ask("答题材料来源", choices=["paste", "file"], default="file")
-    if mode == "file":
-        while True:
-            path = Prompt.ask("txt 文件路径").strip().strip('"').strip("'")
-            if not os.path.exists(path):
-                console.print("[red]文件不存在，请重试[/red]")
-                continue
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                params["materials"] = f.read()
-            console.print(f"[green]已读取 {len(params['materials'])} 字符[/green]")
-            break
-    else:
-        params["materials"] = Prompt.ask("答题材料（粘贴商品介绍/规则）").strip()
-    if not params.get("materials"):
-        console.print("[red]答题材料不能为空[/red]")
+
+def _sale_start_timestamp(value) -> float:
+    """将商品接口的秒/毫秒时间戳或日期字符串转换为本地时间戳。"""
+    if value in (None, "", 0, "0"):
+        return 0
+    try:
+        numeric = float(value)
+        if numeric > 10_000_000_000:
+            numeric /= 1000
+        if numeric > 0:
+            return numeric
+    except (TypeError, ValueError):
+        pass
+    raw = str(value).strip().replace("T", " ").replace("/", "-").rstrip("Z")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(raw, fmt))
+        except ValueError:
+            continue
+    console.print(f"[yellow]无法识别接口开售时间：{value}[/yellow]")
+    return 0
+
+
+def _ask_target_timestamp() -> float:
+    target = Prompt.ask("开抢时间（留空=立即开始，格式 YYYY-MM-DD HH:MM:SS）").strip()
+    if not target:
+        return 0
+    try:
+        return time.mktime(time.strptime(target, "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        console.print("[red]时间格式错误，将立即开始[/red]")
+        return 0
+
+
+def _pick_task_config():
+    configs = _task_configs.list_configs()
+    if not configs:
+        console.print("[yellow]暂无任务配置，请先新建一个。[/yellow]")
+        return None
+    table = Table(title=f"任务配置文件（{len(configs)} 个）")
+    table.add_column("#", justify="right")
+    table.add_column("名称")
+    table.add_column("商品 / 票档")
+    table.add_column("开抢时间")
+    table.add_column("提醒")
+    table.add_column("文件")
+    for i, item in enumerate(configs, 1):
+        params = item["params"]
+        timestamp = params.get("target_ts") or 0
+        sale_time = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+                     if timestamp else "立即开始")
+        table.add_row(str(i), item["name"],
+                      f"{params.get('goods_name') or params.get('goods_id')} / {params.get('sku_name') or params.get('sku_id')}",
+                      sale_time, MODE_NAMES.get(params.get("notify_mode"), "不播放"),
+                      os.path.basename(item["path"]))
+    console.print(table)
+    idx = IntPrompt.ask("选择配置编号", default=1)
+    if not 1 <= idx <= len(configs):
+        console.print("[red]配置编号无效[/red]")
+        return None
+    return configs[idx - 1]
+
+
+def _fill_account_specific_params(acc, params: dict) -> bool:
+    """按本次所选账号补齐地址、实名购买人和核销手机号。
+
+    这些 ID 全都由账号维度维护，不能从任务配置中复用；同时重新读取商品
+    详情，以拿到该账号当前的实名和答题状态。
+    """
+    client = acc.get_client()
+    try:
+        resp = client.get_goods_detail(int(params["goods_id"]))
+        r = parse_resp(resp)
+    except Exception as e:
+        console.print(f"[red]获取账号商品信息失败: {e}[/red]")
         return False
+    if not r["ok"]:
+        console.print(f"[red]获取账号商品信息失败: code={r['code']} msg={r['msg']}[/red]")
+        return False
+    body = r.get("body") or {}
+    info = extract_goods_info(body)
+    gtype = classify_goods(body)
+
+    # 忽略旧配置中残留的账号私有值，绝不跨账号带入。
+    params.pop("address_id", None)
+    params.pop("buyer_ids", None)
+    params.pop("write_off_phone", None)
+    params.pop("store_choice_id", None)
+    if gtype == GOODS_TYPE_COMMON:
+        console.print("[bold cyan]此账号的收货地址[/bold cyan]")
+        _fill_address(client, params)
+    else:
+        label = "核销手机号"
+        params["write_off_phone"] = Prompt.ask(
+            f"{label}（默认当前账号 {acc.phone}）", default=acc.phone).strip()
+
+    reg_type = info.get("ticket_reg_type")
+    if reg_type in (1, 2):
+        params["_ticket_reg_type"] = reg_type
+        console.print("[bold cyan]此账号的实名购买人[/bold cyan]")
+        _fill_buyer(client, params, int(params["goods_id"]))
+    else:
+        params.pop("_ticket_reg_type", None)
     return True
+
+
+def _start_task_from_config(mgr: AccountManager):
+    _clear_page()
+    console.print(Panel.fit("[bold cyan]使用任务配置启动[/bold cyan]", border_style="cyan"))
+    item = _pick_task_config()
+    if not item:
+        Prompt.ask("按回车返回", default="")
+        return
+    # 启动时才选择账号：同一商品/票档/提醒配置可以用于任意已登录账号。
+    acc = _pick_account(mgr)
+    if acc is None:
+        _pause()
+        return
+    params = dict(item["params"])
+    params.pop("serverchan_enabled", None)  # 兼容早期手工配置文件
+    params.pop("deepseek_api_key", None)
+    params.pop("materials", None)
+    # 不在这里校验 API Key/材料文件：运行时会先按此账号判断是否需要答题，
+    # 无需答题的账号可以直接下单，即使本机没有配置答题服务。
+    if not _fill_account_specific_params(acc, params):
+        Prompt.ask("按回车返回", default="")
+        return
+    console.print(f"[bold]配置:[/bold] {item['name']}  [bold]账号:[/bold] {acc.phone}")
+    console.print(f"[bold]商品:[/bold] {params.get('goods_name') or params.get('goods_id')}  "
+                  f"[bold]票档:[/bold] {params.get('sku_name') or params.get('sku_id')}")
+    target_ts = params.get("target_ts") or 0
+    console.print(f"[bold]开抢时间:[/bold] " +
+                  (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(target_ts))
+                   if target_ts else "立即开始"))
+    if not Confirm.ask("确认启动抢票？（回车默认不启动）", default=False):
+        console.print("[yellow]已取消[/yellow]")
+    elif _launch_grab_window(mgr, acc, params):
+        console.print("[green]任务已启动，抢票窗口已打开，可在新窗口查看进度[/green]")
+    else:
+        console.print("[yellow]抢票任务尚未启动，请使用上方命令手动运行[/yellow]")
+    Prompt.ask("按回车返回主菜单", default="")
+
+
+def menu_task_configs(mgr: AccountManager):
+    """任务配置入口：创建一次，之后只选择配置和账号。"""
+    while True:
+        _clear_page()
+        configs = _task_configs.list_configs()
+        console.print(Panel.fit("[bold cyan]任务配置[/bold cyan]", border_style="cyan"))
+        console.print(f"已保存 {len(configs)} 个配置，目录：{_task_configs.directory}")
+        console.print("[dim]1[/dim] 选择配置并启动  [dim]2[/dim] 新建任务配置  "
+                      "[dim]3[/dim] 删除任务配置  [dim]0[/dim] 返回")
+        choice = Prompt.ask("选择", choices=["0", "1", "2", "3"], default="1")
+        if choice == "0":
+            return
+        if choice == "1":
+            _start_task_from_config(mgr)
+        elif choice == "2":
+            menu_create_task_config(mgr)
+        else:
+            item = _pick_task_config()
+            if item and Confirm.ask(f"确认删除配置「{item['name']}」？", default=False):
+                if _task_configs.remove(item["path"]):
+                    console.print("[green]任务配置已删除[/green]")
+                else:
+                    console.print("[red]删除失败：配置文件不在任务配置目录内[/red]")
+                time.sleep(0.5)
 
 
 def _fill_address(client, params: dict):
@@ -1033,7 +1341,7 @@ def _fill_buyer(client, params: dict, goods_id: int):
 
 
 def _launch_grab_window(mgr: AccountManager, acc, params: dict):
-    """在新终端窗口启动抢票。"""
+    """在新终端窗口启动抢票，返回是否启动成功。"""
     fd, path = tempfile.mkstemp(suffix=".json", prefix="grab_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(params, f, ensure_ascii=False)
@@ -1050,15 +1358,28 @@ def _launch_grab_window(mgr: AccountManager, acc, params: dict):
         if sys.platform == "win32":
             # 直接以新控制台窗口运行（避免 start 命令的引号/标题坑）
             subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        elif sys.platform == "darwin":
+            # 通过 AppleScript 让 Terminal 执行命令。命令作为 argv 传入，
+            # 避免路径、手机号或临时文件名破坏 AppleScript 语法。
+            command = shlex.join(args)
+            subprocess.run([
+                "osascript",
+                "-e", "on run argv",
+                "-e", 'tell application "Terminal" to do script (item 1 of argv)',
+                "-e", 'tell application "Terminal" to activate',
+                "-e", "end run",
+                command,
+            ], check=True, capture_output=True, text=True)
         else:
-            subprocess.Popen(["x-terminal-emulator", "-e", "bash", "-c",
-                              f'"{sys.executable}" --grab-window "{mgr.env_dir}" "{acc.phone}" "{path}"'])
+            # Debian/Ubuntu 等 Linux 桌面通常提供这个统一入口。
+            subprocess.Popen(["x-terminal-emulator", "-e", *args])
     except Exception as e:
         console.print(f"[red]启动抢票窗口失败: {e}[/red]")
-        manual = " ".join(f'"{a}"' for a in args) if not frozen else f'"{sys.executable}" --grab-window "{mgr.env_dir}" "{acc.phone}" "{path}"'
+        manual = shlex.join(args)
         console.print(f"[dim]可手动运行: {manual}[/dim]")
-        return
+        return False
     console.print("[green]抢票窗口已启动[/green]")
+    return True
 
 
 # ===================================================================
@@ -1073,22 +1394,25 @@ def main_menu(mgr: AccountManager):
             "[dim]逆向自奇谷米 App 4.9.1 · 单机运行 · 每账号独立环境[/dim]",
             border_style="cyan"))
         console.print("[bold]1[/bold] 账号管理（注册/登录/状态/购买人/地址）")
-        console.print("[bold]2[/bold] 新建抢票任务")
-        console.print("[bold]3[/bold] 设置（DeepSeek API Key / 答题材料 / 默认参数）")
+        console.print("[bold]2[/bold] 任务配置（选择配置和账号后启动）")
+        console.print("[bold]3[/bold] 设置（DeepSeek API Key / 默认参数 / 全局通知）")
         console.print("[bold]4[/bold] 测试通知（哔哔响/音频/TTS）")
+        console.print("[bold]5[/bold] 测试拉题（按商品 ID 直接拉取）")
         console.print("[bold]0[/bold] 退出")
-        choice = Prompt.ask("选择", choices=["0", "1", "2", "3", "4"], default="1")
+        choice = Prompt.ask("选择", choices=["0", "1", "2", "3", "4", "5"], default="1")
         if choice == "0":
             console.print("再见！")
             return
         if choice == "1":
             menu_accounts(mgr)
         elif choice == "2":
-            menu_grab(mgr)
+            menu_task_configs(mgr)
         elif choice == "3":
             menu_config()
         elif choice == "4":
             menu_test_notify()
+        elif choice == "5":
+            menu_test_fetch_questions(mgr)
 
 
 def menu_test_notify():

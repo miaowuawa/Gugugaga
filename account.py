@@ -302,12 +302,22 @@ class AccountManager:
 
     def list_accounts(self) -> list:
         out = []
-        for name in sorted(os.listdir(self.env_dir)):
+        for name in os.listdir(self.env_dir):
             if not name.endswith(".json"):
                 continue
             phone = name[:-5]
             out.append(self.get(phone))
-        return out
+        # 账号文件首次创建时写入 created_at；老文件没有该字段时使用文件创建
+        # 时间兜底。不要再按手机号排序，避免新增账号跳到列表中间。
+        def added_at(account):
+            value = account.data.get("created_at")
+            if value:
+                return str(value)
+            try:
+                return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getctime(account.path)))
+            except OSError:
+                return "9999-12-31 23:59:59"
+        return sorted(out, key=lambda account: (added_at(account), account.phone))
 
     def get(self, phone: str) -> Account:
         if phone not in self._cache:
@@ -321,3 +331,18 @@ class AccountManager:
             os.remove(p)
             return True
         return False
+
+    def clear_all(self) -> int:
+        """删除账号目录中的全部账号环境文件，返回实际删除数量。"""
+        removed = 0
+        for name in os.listdir(self.env_dir):
+            if not name.endswith(".json"):
+                continue
+            phone = name[:-5]
+            path = self._path(phone)
+            # 仅处理账号目录直属的普通 JSON 文件，避免越界删除。
+            if os.path.isfile(path):
+                os.remove(path)
+                self._cache.pop(phone, None)
+                removed += 1
+        return removed

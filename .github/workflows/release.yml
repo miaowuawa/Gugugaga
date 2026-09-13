@@ -59,6 +59,8 @@ jobs:
         run: |
           echo "Packaging revision: $(git rev-parse HEAD)"
           git log -1 --oneline
+          test -f task_config.py
+          echo "Task-config source: $(git log -1 --format=%h -- task_config.py)"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -82,6 +84,7 @@ jobs:
           --hidden-import qigumi_grabber.serverchan
           --hidden-import qigumi_grabber.proxy
           --hidden-import qigumi_grabber.notify
+          --hidden-import qigumi_grabber.task_config
           ${{ matrix.hidden_imports }} __main__.py
 
       - name: Upload platform artifact

@@ -4,7 +4,7 @@
 下单链路: commonDetail -> orderConfirm -> createOrder -> payOrder
 延迟策略：刷新延迟默认 500ms、下单延迟默认 500ms，均加随机抖动。
 答题：最短用时 6 秒（先 AI 作答，不足 6s 补齐再提交），最大重试 3 次。
-代理：全局代理提取链接（巨量代理），IP 被限速（连续"频繁"且 code=400 超过 2 次）自动换 IP，
+代理：全局代理提取链接（兼容巨量、闪臣），IP 被限速（连续"频繁"且 code=400 超过 2 次）自动换 IP，
       剩余有效期不足时自动换 IP。
 """
 import json
@@ -99,7 +99,7 @@ class GrabTask:
             # 1. 开售前答题（pre_sale 模式）：先答题，通过后等待开抢
             if p.get("answer_mode") == "pre_sale":
                 self._set(status="answering", msg="开售前答题中")
-                need, detail = self._check_need_answer(client)
+                need, detail = self._check_need_answer(client, expected_timing=1)
                 if need:
                     ok, detail = self._do_answer(client)
                     if not ok:
@@ -125,7 +125,7 @@ class GrabTask:
             # 3. 开售后答题（若需要）
             if p.get("answer_mode") == "post_auto":
                 self._set(status="answering", msg="检查是否需要答题")
-                need, detail = self._check_need_answer(client)
+                need, detail = self._check_need_answer(client, expected_timing=2)
                 if not need:
                     self._set(answer_passed=True, msg=f"无需答题（{detail}），直接下单")
                 else:
@@ -336,12 +336,12 @@ class GrabTask:
 
     # ---------- 答题 ----------
 
-    def _check_need_answer(self, client) -> tuple:
+    def _check_need_answer(self, client, expected_timing=None) -> tuple:
         """检查该账号当前是否需要答题。
 
         逆向自 App：isNeedQuestion 判定 = is_need_question==1 且
-        answer_buy_timing_type==2（开售后答题）且已开售。若商品详情显示
-        is_need_question==0（已通过答题/无需答题），则跳过答题直接下单。
+        is_need_question==1 且答题时机与当前流程一致。商品详情显示
+        is_need_question==0（已通过答题/无需答题）时，不会读取答题材料。
         """
         p = self.params
         goods_id = int(p["goods_id"])
@@ -358,16 +358,25 @@ class GrabTask:
         timing = cfg.get("answer_buy_timing_type")
         if is_need != 1:
             return False, "该账号无需答题"
-        if timing != 2:
-            return False, f"答题时机类型={timing}（非开售后答题）"
+        if expected_timing is not None and timing != expected_timing:
+            label = "开售前" if expected_timing == 1 else "开售后"
+            return False, f"答题时机类型={timing}（非{label}答题）"
         return True, "需要答题"
 
     def _do_answer(self, client) -> tuple:
         """开售后答题：拉题(重试3次) -> DeepSeek -> 补齐6秒 -> checkAnswer。"""
         p = self.params
         goods_id = int(p["goods_id"])
-        api_key = p.get("deepseek_api_key", "")
+        # API Key 是全局设置；材料路径是任务配置。两者都不写入临时运行参数。
+        api_key = p.get("deepseek_api_key", "") or Config().get("deepseek_api_key", "")
         materials = p.get("materials", "")
+        material_path = p.get("materials_path", "")
+        if not materials and material_path:
+            try:
+                with open(material_path, "r", encoding="utf-8", errors="replace") as f:
+                    materials = f.read()
+            except OSError as e:
+                return False, f"答题材料文件无法读取: {e}"
         if not api_key:
             return False, "DeepSeek API Key 未配置"
         if not materials:
