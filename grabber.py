@@ -24,6 +24,10 @@ DEFAULT_REFRESH_DELAY_MS = 500
 DEFAULT_ORDER_DELAY_MS = 500
 JITTER_MS = 100
 WAIT_SPIN_NS = 5_000_000  # 最后 5ms 忙等，避免 sleep 调度延迟
+# 闪臣短效代理有效期通常很短：开售前 5 秒批量测速，避免提前提取后过期。
+PROXY_PREPARE_LEAD_SECONDS = 5
+PROXY_PROBE_TIMEOUT_SECONDS = 2.0
+PROXY_CANDIDATE_COUNT = 10
 # 连续出现"频繁"且 code=400 超过该次数时判定 IP 被限速，换 IP
 FREQUENT_LIMIT = 2
 
@@ -108,7 +112,8 @@ class GrabTask:
             target_ts = p.get("target_ts") or 0
             if target_ts > time.time():
                 self._set(status="waiting", msg="等待开抢时间")
-                if self._wait_until_target(target_ts):
+                if self._wait_until_target(target_ts,
+                                           on_pre_target=lambda: self._select_fastest_proxy(client)):
                     self._set(status="stopped", msg="已停止（等待阶段）")
                     return
 
@@ -231,6 +236,25 @@ class GrabTask:
         self._log("proxy", -1, f"更换代理失败: {result['msg']}")
         return False
 
+    def _select_fastest_proxy(self, client):
+        """在开售前批量测速并切换到最低延迟代理；失败时保留当前代理。"""
+        if not self._proxy_mgr or self._stop.is_set():
+            return
+        self._set(msg=f"开抢前提取 {PROXY_CANDIDATE_COUNT} 个代理并发测速")
+        result = self._proxy_mgr.select_fastest(
+            count=PROXY_CANDIDATE_COUNT, timeout=PROXY_PROBE_TIMEOUT_SECONDS)
+        if not result.get("ok"):
+            self._log("proxy", -1, f"开抢前代理测速失败，保留当前代理: {result.get('msg', '')}")
+            self._set(msg=f"开抢前代理测速失败，保留当前代理: {result.get('msg', '')}")
+            return
+        client.set_proxies(self._proxy_mgr.requests_proxies())
+        proxy = result["proxy"]
+        latency_ms = proxy.get("latency", 0) * 1000
+        message = (f"开抢前测速完成：{result['tested']}/{result['received']} 个可用，"
+                   f"已选择 {proxy['ip']}:{proxy['port']}（{latency_ms:.0f}ms）")
+        self._log("proxy", 0, message)
+        self._set(msg=message)
+
     @staticmethod
     def _is_frequent(result: dict) -> bool:
         """判断是否为 IP 限速：code=400 且消息含"频繁"。"""
@@ -264,7 +288,7 @@ class GrabTask:
             time.sleep(min(0.05, end - time.time()))
         return False
 
-    def _wait_until_target(self, target_ts: float) -> bool:
+    def _wait_until_target(self, target_ts: float, on_pre_target=None) -> bool:
         """等待到 Unix 时间戳；返回 True 表示被停止。
 
         先用墙上时钟将目标时间换算成单调时钟的 deadline，避免等待途中
@@ -275,10 +299,19 @@ class GrabTask:
         if remaining <= 0:
             return False
         deadline_ns = time.monotonic_ns() + int(remaining * 1_000_000_000)
+        # 回调可能需要数秒的网络时间；目标已很近时宁可跳过，不能拖慢开抢。
+        prepare_at_ns = deadline_ns - int(PROXY_PREPARE_LEAD_SECONDS * 1_000_000_000)
+        prepare_pending = on_pre_target is not None and remaining > PROXY_PREPARE_LEAD_SECONDS
         while True:
             if self._stop.is_set():
                 return True
-            remaining_ns = deadline_ns - time.monotonic_ns()
+            now_ns = time.monotonic_ns()
+            if prepare_pending and now_ns >= prepare_at_ns:
+                prepare_pending = False
+                on_pre_target()
+                # 测速期间可能已经到点，马上重新检查 deadline。
+                continue
+            remaining_ns = deadline_ns - now_ns
             if remaining_ns <= 0:
                 return False
             # 最后 5ms 忙等；不会再被 sleep 的系统调度粒度拖后。

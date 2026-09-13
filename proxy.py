@@ -8,6 +8,8 @@ ip_remain 为剩余秒数，过期后需重新提取。
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 
@@ -30,13 +32,20 @@ class ProxyManager:
 
     # ---------- 提取 ----------
 
-    def extract(self, num: int = 1) -> dict:
-        """从提取链接获取代理。返回 {"ok", "proxy", "msg"}。"""
+    def extract(self, num: int = 1, timeout: float = 20) -> dict:
+        """从提取链接获取一个代理。返回 {"ok", "proxy", "msg"}。"""
+        result = self.extract_many(num=num, timeout=timeout)
+        if not result["ok"]:
+            return result
+        return {"ok": True, "proxy": result["proxies"][0], "msg": result["msg"]}
+
+    def extract_many(self, num: int = 1, timeout: float = 20) -> dict:
+        """从提取链接获取一批代理，尽量保留服务商返回的全部地址。"""
         url = self.extract_url()
         if not url:
             return {"ok": False, "msg": "未配置代理提取链接"}
         try:
-            resp = requests.get(url, timeout=20)
+            resp = requests.get(_url_with_requested_count(url, num), timeout=timeout)
             data = resp.json()
         except Exception as e:
             return {"ok": False, "msg": f"提取代理失败: {e}"}
@@ -53,18 +62,22 @@ class ProxyManager:
         plist = (data.get("data") or {}).get("proxy_list") or []
         if not plist:
             return {"ok": False, "msg": "提取代理返回空列表"}
-        p = plist[0]
-        proxy = {
-            "ip": p.get("ip"),
-            "port": str(p.get("port")),
-            "user": p.get("http_user"),
-            "pass": p.get("http_pass"),
-            "remain": int(p.get("ip_remain") or 0),
-            "city": p.get("city") or "",
-        }
-        if not proxy["ip"] or not proxy["port"]:
-            return {"ok": False, "msg": f"代理信息不完整: {p}"}
-        return {"ok": True, "proxy": proxy, "msg": "提取成功"}
+        proxies = []
+        for item in plist:
+            if not isinstance(item, dict) or not item.get("ip") or not item.get("port"):
+                continue
+            proxies.append({
+                "ip": str(item["ip"]),
+                "port": str(item["port"]),
+                "user": item.get("http_user"),
+                "pass": item.get("http_pass"),
+                "remain": int(item.get("ip_remain") or 0),
+                "city": item.get("city") or "",
+            })
+        if not proxies:
+            return {"ok": False, "msg": "提取代理返回的地址不完整"}
+        return {"ok": True, "proxy": proxies[0], "proxies": proxies,
+                "msg": f"提取成功（{len(proxies)} 个）"}
 
     @staticmethod
     def _parse_shanchen_response(data: dict) -> dict:
@@ -77,29 +90,35 @@ class ProxyManager:
         if not isinstance(plist, list) or not plist or not isinstance(plist[0], dict):
             return {"ok": False, "msg": "闪臣提取失败: 返回代理列表为空"}
 
-        item = plist[0]
-        ip = item.get("sever") or item.get("server") or item.get("ip")
-        port = item.get("port")
-        if not ip or not port:
-            return {"ok": False, "msg": f"闪臣提取失败: 代理信息不完整: {item}"}
-        proxy = {
-            "ip": str(ip),
-            "port": str(port),
-            "user": item.get("http_user") or item.get("user"),
-            "pass": item.get("http_pass") or item.get("pass"),
-            "remain": 0,
-            "city": item.get("city") or "",
-            "net_type": item.get("net_type"),
-        }
-        expire_ts = _parse_expire_timestamp(data.get("expire") or item.get("expire"))
-        if expire_ts is not None:
-            proxy["expire_ts"] = expire_ts
-            proxy["remain"] = max(0, int(expire_ts - time.time()))
-        return {"ok": True, "proxy": proxy, "msg": "闪臣提取成功"}
+        proxies = []
+        expire_ts = _parse_expire_timestamp(data.get("expire"))
+        for item in plist:
+            ip = item.get("sever") or item.get("server") or item.get("ip")
+            port = item.get("port")
+            if not ip or not port:
+                continue
+            proxy = {
+                "ip": str(ip),
+                "port": str(port),
+                "user": item.get("http_user") or item.get("user"),
+                "pass": item.get("http_pass") or item.get("pass"),
+                "remain": 0,
+                "city": item.get("city") or "",
+                "net_type": item.get("net_type"),
+            }
+            item_expire_ts = _parse_expire_timestamp(item.get("expire")) or expire_ts
+            if item_expire_ts is not None:
+                proxy["expire_ts"] = item_expire_ts
+                proxy["remain"] = max(0, int(item_expire_ts - time.time()))
+            proxies.append(proxy)
+        if not proxies:
+            return {"ok": False, "msg": "闪臣提取失败: 返回的代理信息不完整"}
+        return {"ok": True, "proxy": proxies[0], "proxies": proxies,
+                "msg": f"闪臣提取成功（{len(proxies)} 个）"}
 
     # ---------- 测试 ----------
 
-    def test(self, proxy: dict = None) -> dict:
+    def test(self, proxy: dict = None, timeout: float = 15) -> dict:
         """测试代理可用性（访问奇谷米配置接口）。返回 {"ok", "msg", "elapsed"}。"""
         p = proxy or self._current
         if not p:
@@ -108,11 +127,39 @@ class ProxyManager:
         start = time.time()
         try:
             resp = requests.get("https://app.qigumi.com/api/v3/configuration/query",
-                                proxies=proxies, timeout=15)
+                                proxies=proxies, timeout=timeout)
             ok = resp.status_code == 200
             return {"ok": ok, "msg": f"HTTP {resp.status_code}", "elapsed": time.time() - start}
         except Exception as e:
             return {"ok": False, "msg": f"测试失败: {e}", "elapsed": time.time() - start}
+
+    def select_fastest(self, count: int = 10, timeout: float = 2.5) -> dict:
+        """批量提取并并发测速，选出延迟最低的可用代理。"""
+        result = self.extract_many(num=count, timeout=timeout)
+        if not result["ok"]:
+            return result
+        candidates = result["proxies"]
+        tested = []
+        # 并发测试保证总耗时接近最慢的单个请求，而不是 10 倍串行耗时。
+        with ThreadPoolExecutor(max_workers=min(len(candidates), count)) as executor:
+            futures = {executor.submit(self.test, proxy, timeout): proxy for proxy in candidates}
+            for future in as_completed(futures):
+                proxy = futures[future]
+                try:
+                    probe = future.result()
+                except Exception as e:
+                    probe = {"ok": False, "msg": str(e), "elapsed": timeout}
+                if probe.get("ok"):
+                    proxy["latency"] = probe.get("elapsed", timeout)
+                    tested.append(proxy)
+        if not tested:
+            return {"ok": False, "msg": f"已提取 {len(candidates)} 个代理，但测速均失败"}
+        fastest = min(tested, key=lambda proxy: proxy["latency"])
+        self._set_expire_ts(fastest)
+        with self._lock:
+            self._current = fastest
+        return {"ok": True, "proxy": fastest, "tested": len(tested),
+                "received": len(candidates), "msg": "已选择最低延迟代理"}
 
     # ---------- 使用 ----------
 
@@ -192,3 +239,17 @@ def _parse_expire_timestamp(value):
         except ValueError:
             continue
     return None
+
+
+def _url_with_requested_count(url: str, count: int) -> str:
+    """只改写提取链接中已有的 count/num 参数，避免破坏其他服务商链接。"""
+    if count <= 1:
+        return url
+    parts = urlsplit(url)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    names = {name for name, _ in pairs}
+    if "count" not in names and "num" not in names:
+        return url
+    query = [(name, str(count) if name in ("count", "num") else value)
+             for name, value in pairs]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
