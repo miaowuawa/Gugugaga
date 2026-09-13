@@ -50,6 +50,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: qigumi_grabber
+          # 手动运行始终打包默认分支最新提交；标签触发则严格打包该标签。
+          ref: ${{ github.event_name == 'push' && github.ref || github.event.repository.default_branch }}
+          fetch-depth: 1
+
+      - name: Show packaged revision
+        shell: bash
+        run: |
+          echo "Packaging revision: $(git rev-parse HEAD)"
+          git log -1 --oneline
 
       - name: Set up Python
         uses: actions/setup-python@v5

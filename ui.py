@@ -32,13 +32,20 @@ GOODS_URL_RE = re.compile(r"goods_id=(\d+)")
 _cfg = Config()
 
 
+def _clear_page():
+    """切换页面时清屏；兼容不完整支持 ANSI 的 Windows 终端。"""
+    console.clear()
+    if os.name == "nt":
+        os.system("cls")
+
+
 # ===================================================================
 # 设置（DeepSeek API Key 等）
 # ===================================================================
 
 def menu_config():
     while True:
-        console.clear()
+        _clear_page()
         console.print(Panel.fit("[bold cyan]设置[/bold cyan]", border_style="cyan"))
         console.print(f"DeepSeek API Key: [bold]{_cfg.get('deepseek_api_key', '') or '[dim]未配置[/dim]'}[/bold]")
         console.print(f"DeepSeek Base URL: {_cfg.get('deepseek_base_url', 'https://api.deepseek.com')}")
@@ -95,6 +102,7 @@ def menu_config():
 
 def _set_serverchan_sendkey():
     """设置全局 Server酱³ SendKey；留空可清除已有配置。"""
+    _clear_page()
     from qigumi_grabber.serverchan import parse_uid
     sk = Prompt.ask("Server酱³ SendKey（SCT 开头，留空清除）").strip()
     if sk and not parse_uid(sk):
@@ -107,6 +115,7 @@ def _set_serverchan_sendkey():
 
 def _test_serverchan():
     """使用全局 SendKey 发送一条 Server酱³ 测试通知。"""
+    _clear_page()
     from qigumi_grabber.serverchan import send
     sk = _cfg.get("serverchan_sendkey", "").strip()
     if not sk:
@@ -122,6 +131,7 @@ def _test_serverchan():
 
 def _test_proxy():
     """测试代理：提取一个 IP，连续请求 10 次并输出每次延迟。"""
+    _clear_page()
     from qigumi_grabber.proxy import ProxyManager
     pm = ProxyManager(_cfg)
     if not pm.is_configured():
@@ -314,7 +324,7 @@ def _menu_buyers(mgr: AccountManager):
     if acc is None:
         return
     while True:
-        console.clear()
+        _clear_page()
         console.print(Panel.fit(f"[bold cyan]购买人管理 — {acc.phone}[/bold cyan]",
                                 border_style="cyan"))
         client = acc.get_client()
@@ -441,7 +451,7 @@ def _menu_addresses(mgr: AccountManager):
     if acc is None:
         return
     while True:
-        console.clear()
+        _clear_page()
         console.print(Panel.fit(f"[bold cyan]收货地址管理 — {acc.phone}[/bold cyan]",
                                 border_style="cyan"))
         client = acc.get_client()
@@ -1057,7 +1067,7 @@ def _launch_grab_window(mgr: AccountManager, acc, params: dict):
 
 def main_menu(mgr: AccountManager):
     while True:
-        console.clear()
+        _clear_page()
         console.print(Panel.fit(
             "[bold cyan]奇谷米单机抢票器[/bold cyan]\n"
             "[dim]逆向自奇谷米 App 4.9.1 · 单机运行 · 每账号独立环境[/dim]",
@@ -1085,7 +1095,7 @@ def menu_test_notify():
     """测试通知：选择模式并试听，循环播放直到按任意键。"""
     from qigumi_grabber.notify import Notifier, wait_any_key
     while True:
-        console.clear()
+        _clear_page()
         console.print(Panel.fit("[bold cyan]测试通知[/bold cyan]", border_style="cyan"))
         console.print("[dim]1[/dim] 哔哔响")
         console.print("[dim]2[/dim] 播放音频文件")
