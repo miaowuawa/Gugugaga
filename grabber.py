@@ -3,7 +3,7 @@
 
 下单链路: commonDetail -> orderConfirm -> createOrder -> payOrder
 延迟策略：刷新延迟默认 500ms、下单延迟默认 500ms，均加随机抖动。
-答题：最短用时 5.2 秒（先 AI 作答，不足 5.2s 补齐再提交），最大重试 3 次。
+答题：最短用时可配置（默认 6 秒；先 AI 作答，不足设定时间补齐再提交），最大重试 3 次。
 代理：全局代理提取链接（兼容巨量、闪臣），IP 被限速（连续"频繁"且 code=400 超过 2 次）自动换 IP，
       剩余有效期不足时自动换 IP。
 """
@@ -18,7 +18,9 @@ from .config import Config
 from .goods import classify_goods, extract_goods_info, extract_reservation_options
 from .proxy import ProxyManager
 
-MIN_ANSWER_SECONDS = 5.2
+DEFAULT_ANSWER_SECONDS = 6.0
+# 保留旧常量名，供外部调用方兼容；实际任务会读取全局配置。
+MIN_ANSWER_SECONDS = DEFAULT_ANSWER_SECONDS
 MAX_ANSWER_RETRIES = 3
 DEFAULT_REFRESH_DELAY_MS = 500
 DEFAULT_ORDER_DELAY_MS = 500
@@ -364,9 +366,16 @@ class GrabTask:
         return True, "需要答题"
 
     def _do_answer(self, client) -> tuple:
-        """开售后答题：拉题(重试3次) -> DeepSeek -> 补齐5.2秒 -> checkAnswer。"""
+        """开售后答题：拉题(重试3次) -> DeepSeek -> 补齐设定时间 -> checkAnswer。"""
         p = self.params
         goods_id = int(p["goods_id"])
+        try:
+            min_answer_seconds = float(Config().get(
+                "default_answer_time_seconds", DEFAULT_ANSWER_SECONDS))
+            if min_answer_seconds <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            min_answer_seconds = DEFAULT_ANSWER_SECONDS
         # API Key 是全局设置；材料路径是任务配置。两者都不写入临时运行参数。
         api_key = p.get("deepseek_api_key", "") or Config().get("deepseek_api_key", "")
         materials = p.get("materials", "")
@@ -413,11 +422,11 @@ class GrabTask:
                     return False, "已停止"
                 continue
 
-            # 补齐最短答题时间（5.2 秒）
+            # 补齐用户设置的最短答题时间
             elapsed = time.time() - answer_start
-            if elapsed < MIN_ANSWER_SECONDS:
-                self._set(msg=f"答题完成，补齐至 {MIN_ANSWER_SECONDS} 秒")
-                if self._sleep(MIN_ANSWER_SECONDS - elapsed):
+            if elapsed < min_answer_seconds:
+                self._set(msg=f"答题完成，补齐至 {min_answer_seconds:g} 秒")
+                if self._sleep(min_answer_seconds - elapsed):
                     return False, "已停止"
             used_time = max(0, int(time.time() - answer_start))
 

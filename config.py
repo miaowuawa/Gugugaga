@@ -16,6 +16,7 @@ DEFAULT_CONFIG = {
     "default_refresh_delay_ms": 500,
     "default_order_delay_ms": 500,
     "default_max_retries": 0,
+    "default_answer_time_seconds": 6,
     "default_pay_type": "2",
 }
 

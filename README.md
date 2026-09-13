@@ -90,7 +90,7 @@ macOS/Linux 可靠地交叉编译 Windows exe，因此 Windows 本机构建或�
 主菜单的“设置”可维护：
 
 - DeepSeek API Key、Base URL 和模型；
-- 默认刷新/下单延迟与最大重试次数；
+- 默认刷新/下单延迟、最大重试次数和答题完成时间（默认 6 秒）；
 - 默认支付方式；
 - 巨量代理提取链接；
 - Server酱³ SendKey。

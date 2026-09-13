@@ -61,13 +61,20 @@ def menu_config():
         serverchan_status = (f"已配置（...{serverchan_sendkey[-6:]}）"
                              if serverchan_sendkey else "[dim]未配置[/dim]")
         console.print(f"Server酱³ SendKey: [bold]{serverchan_status}[/bold]")
+        try:
+            answer_seconds = float(_cfg.get("default_answer_time_seconds", 6))
+            if answer_seconds <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            answer_seconds = 6.0
         console.print(f"默认刷新延迟: {_cfg.get('default_refresh_delay_ms')}ms  "
                       f"默认下单延迟: {_cfg.get('default_order_delay_ms')}ms  "
-                      f"默认最大重试: {_cfg.get('default_max_retries')}")
+                      f"默认最大重试: {_cfg.get('default_max_retries')}  "
+                      f"答题完成时间: {answer_seconds:g}秒")
         console.print(f"默认支付方式: {'支付宝' if _cfg.get('default_pay_type') == '2' else '微信'}")
         console.print(f"配置文件: {_cfg.path}")
         console.print("[dim]1[/dim] 设置 DeepSeek API Key  "
-                      "[dim]2[/dim] 默认延迟/重试  [dim]3[/dim] 默认支付方式  "
+                      "[dim]2[/dim] 默认延迟/重试/答题时间  [dim]3[/dim] 默认支付方式  "
                       "[dim]4[/dim] 设置代理提取链接  [dim]5[/dim] 测试代理  "
                       "[dim]6[/dim] 设置 Server酱³ SendKey  "
                       "[dim]7[/dim] 测试 Server酱³  [dim]0[/dim] 返回")
@@ -86,6 +93,17 @@ def menu_config():
                      IntPrompt.ask("默认下单延迟(ms)", default=int(_cfg.get("default_order_delay_ms", 500))))
             _cfg.set("default_max_retries",
                      IntPrompt.ask("默认最大重试次数(0=无限)", default=int(_cfg.get("default_max_retries", 0))))
+            while True:
+                raw = Prompt.ask("答题完成时间(秒，默认 6)",
+                                 default=f"{answer_seconds:g}")
+                try:
+                    answer_seconds = float(raw)
+                    if answer_seconds <= 0:
+                        raise ValueError
+                    _cfg.set("default_answer_time_seconds", answer_seconds)
+                    break
+                except ValueError:
+                    console.print("[red]请输入大于 0 的数字，例如 6 或 5.2[/red]")
             console.print("[green]已保存[/green]")
         elif choice == "3":
             pay = Prompt.ask("默认支付方式", choices=["1", "2"], default=str(_cfg.get("default_pay_type", "2")))
