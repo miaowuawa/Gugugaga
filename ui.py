@@ -121,7 +121,7 @@ def _test_serverchan():
 
 
 def _test_proxy():
-    """测试代理：提取一个 IP 并验证可用性。"""
+    """测试代理：提取一个 IP，连续请求 10 次并输出每次延迟。"""
     from qigumi_grabber.proxy import ProxyManager
     pm = ProxyManager(_cfg)
     if not pm.is_configured():
@@ -134,10 +134,16 @@ def _test_proxy():
         return
     p = result["proxy"]
     console.print(f"[green]提取成功: {p['ip']}:{p['port']}  城市={p.get('city')}  剩余={p.get('remain')}s[/green]")
-    console.print("[dim]正在测试连通性...[/dim]")
-    t = pm.test(p)
-    if t["ok"]:
-        console.print(f"[green]代理可用: {t['msg']}（{t.get('elapsed', 0):.2f}s）[/green]")
+    console.print("[dim]正在连续测试 10 次连通性...[/dim]")
+    t = pm.test_many(p, attempts=10)
+    for sample in t.get("samples", []):
+        if sample.get("ok"):
+            console.print(f"  第 {sample['index']} 次: {sample.get('elapsed', 0) * 1000:.0f}ms")
+        else:
+            console.print(f"  [red]第 {sample['index']} 次失败: {sample.get('msg', '')}[/red]")
+    if t.get("successes", 0):
+        style = "green" if t["ok"] else "yellow"
+        console.print(f"[{style}]代理测试: {t['msg']}[/]")
     else:
         console.print(f"[red]代理不可用: {t['msg']}[/red]")
 

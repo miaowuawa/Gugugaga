@@ -133,16 +133,41 @@ class ProxyManager:
         except Exception as e:
             return {"ok": False, "msg": f"测试失败: {e}", "elapsed": time.time() - start}
 
-    def select_fastest(self, count: int = 10, timeout: float = 2.5) -> dict:
-        """批量提取并并发测速，选出延迟最低的可用代理。"""
-        result = self.extract_many(num=count, timeout=timeout)
+    def test_many(self, proxy: dict = None, attempts: int = 10,
+                  timeout: float = 3) -> dict:
+        """连续测试同一代理多次，返回每次延迟与成功请求的平均延迟。"""
+        attempts = max(1, int(attempts))
+        samples = []
+        for index in range(1, attempts + 1):
+            result = self.test(proxy, timeout=timeout)
+            samples.append({"index": index, **result})
+        successful = [sample["elapsed"] for sample in samples if sample.get("ok")]
+        if not successful:
+            return {"ok": False, "msg": f"{attempts} 次测试均失败", "samples": samples,
+                    "successes": 0}
+        average = sum(successful) / len(successful)
+        return {
+            "ok": len(successful) == attempts,
+            "msg": f"{len(successful)}/{attempts} 次成功，平均 {average * 1000:.0f}ms",
+            "elapsed": average,
+            "samples": samples,
+            "successes": len(successful),
+        }
+
+    def select_fastest(self, count: int = 10, samples: int = 10,
+                       timeout: float = 0.3, extract_timeout: float = 2) -> dict:
+        """批量提取并并发多次测速，按平均延迟选出最稳定的代理。"""
+        result = self.extract_many(num=count, timeout=extract_timeout)
         if not result["ok"]:
             return result
         candidates = result["proxies"]
         tested = []
-        # 并发测试保证总耗时接近最慢的单个请求，而不是 10 倍串行耗时。
+        # 各候选之间并发；同一代理连续测 samples 次，以平均延迟排除偶发抖动。
         with ThreadPoolExecutor(max_workers=min(len(candidates), count)) as executor:
-            futures = {executor.submit(self.test, proxy, timeout): proxy for proxy in candidates}
+            futures = {
+                executor.submit(self.test_many, proxy, samples, timeout): proxy
+                for proxy in candidates
+            }
             for future in as_completed(futures):
                 proxy = futures[future]
                 try:
@@ -151,15 +176,18 @@ class ProxyManager:
                     probe = {"ok": False, "msg": str(e), "elapsed": timeout}
                 if probe.get("ok"):
                     proxy["latency"] = probe.get("elapsed", timeout)
+                    proxy["latency_samples"] = probe.get("samples", [])
                     tested.append(proxy)
         if not tested:
-            return {"ok": False, "msg": f"已提取 {len(candidates)} 个代理，但测速均失败"}
+            return {"ok": False,
+                    "msg": f"已提取 {len(candidates)} 个代理，但没有代理通过 {samples} 次测速"}
         fastest = min(tested, key=lambda proxy: proxy["latency"])
         self._set_expire_ts(fastest)
         with self._lock:
             self._current = fastest
         return {"ok": True, "proxy": fastest, "tested": len(tested),
-                "received": len(candidates), "msg": "已选择最低延迟代理"}
+                "received": len(candidates), "samples": samples,
+                "msg": "已选择平均延迟最低代理"}
 
     # ---------- 使用 ----------
 

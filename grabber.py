@@ -24,10 +24,11 @@ DEFAULT_REFRESH_DELAY_MS = 500
 DEFAULT_ORDER_DELAY_MS = 500
 JITTER_MS = 100
 WAIT_SPIN_NS = 5_000_000  # 最后 5ms 忙等，避免 sleep 调度延迟
-# 闪臣短效代理有效期通常很短：开售前 5 秒批量测速，避免提前提取后过期。
-PROXY_PREPARE_LEAD_SECONDS = 5
-PROXY_PROBE_TIMEOUT_SECONDS = 2.0
+# 闪臣短效代理有效期通常很短：开售前 7 秒批量测速，避免提前提取后过期。
+PROXY_PREPARE_LEAD_SECONDS = 7
+PROXY_PROBE_TIMEOUT_SECONDS = 0.3
 PROXY_CANDIDATE_COUNT = 10
+PROXY_LATENCY_SAMPLE_COUNT = 10
 # 连续出现"频繁"且 code=400 超过该次数时判定 IP 被限速，换 IP
 FREQUENT_LIMIT = 2
 
@@ -242,7 +243,8 @@ class GrabTask:
             return
         self._set(msg=f"开抢前提取 {PROXY_CANDIDATE_COUNT} 个代理并发测速")
         result = self._proxy_mgr.select_fastest(
-            count=PROXY_CANDIDATE_COUNT, timeout=PROXY_PROBE_TIMEOUT_SECONDS)
+            count=PROXY_CANDIDATE_COUNT, samples=PROXY_LATENCY_SAMPLE_COUNT,
+            timeout=PROXY_PROBE_TIMEOUT_SECONDS)
         if not result.get("ok"):
             self._log("proxy", -1, f"开抢前代理测速失败，保留当前代理: {result.get('msg', '')}")
             self._set(msg=f"开抢前代理测速失败，保留当前代理: {result.get('msg', '')}")
@@ -250,8 +252,14 @@ class GrabTask:
         client.set_proxies(self._proxy_mgr.requests_proxies())
         proxy = result["proxy"]
         latency_ms = proxy.get("latency", 0) * 1000
+        sample_text = "、".join(
+            f"{sample['index']}={sample.get('elapsed', 0) * 1000:.0f}ms"
+            if sample.get("ok") else f"{sample['index']}=失败"
+            for sample in proxy.get("latency_samples", [])
+        )
         message = (f"开抢前测速完成：{result['tested']}/{result['received']} 个可用，"
-                   f"已选择 {proxy['ip']}:{proxy['port']}（{latency_ms:.0f}ms）")
+                   f"已选择 {proxy['ip']}:{proxy['port']}（平均 {latency_ms:.0f}ms）\n"
+                   f"10 次延迟：{sample_text}")
         self._log("proxy", 0, message)
         self._set(msg=message)
 
