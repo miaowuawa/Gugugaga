@@ -11,7 +11,7 @@ DEFAULT_CONFIG = {
     "deepseek_api_key": "",
     "deepseek_base_url": "https://api.deepseek.com",
     "deepseek_model": "deepseek-v4-flash",
-    "proxy_extract_url": "",  # 巨量代理提取链接（全局，每个任务复用）
+    "proxy_extract_url": "",  # 代理提取链接（兼容巨量、闪臣；全局复用）
     "serverchan_sendkey": "",  # Server酱³ SendKey（全局，每个任务复用）
     "default_refresh_delay_ms": 500,
     "default_order_delay_ms": 500,

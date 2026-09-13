@@ -44,7 +44,8 @@ def menu_config():
         console.print(f"DeepSeek Base URL: {_cfg.get('deepseek_base_url', 'https://api.deepseek.com')}")
         console.print(f"DeepSeek Model: {_cfg.get('deepseek_model', 'deepseek-v4-flash')}")
         proxy_url = _cfg.get("proxy_extract_url", "")
-        console.print(f"代理提取链接: [bold]{proxy_url[:60] + '...' if len(proxy_url) > 60 else (proxy_url or '[dim]未配置[/dim]')}[/bold]")
+        proxy_status = "已配置（链接已隐藏）" if proxy_url else "[dim]未配置[/dim]"
+        console.print(f"代理提取链接: [bold]{proxy_status}[/bold]")
         serverchan_sendkey = _cfg.get("serverchan_sendkey", "")
         serverchan_status = (f"已配置（...{serverchan_sendkey[-6:]}）"
                              if serverchan_sendkey else "[dim]未配置[/dim]")
@@ -80,7 +81,7 @@ def menu_config():
             _cfg.set("default_pay_type", pay)
             console.print("[green]已保存[/green]")
         elif choice == "4":
-            url = Prompt.ask("巨量代理提取链接（留空清除）").strip()
+            url = Prompt.ask("代理提取链接（兼容巨量 / 闪臣；留空清除）").strip()
             _cfg.set("proxy_extract_url", url)
             console.print("[green]已保存[/green]")
         elif choice == "5":
