@@ -34,12 +34,19 @@ def _play_success_sound():
 
 def _fmt_pay(pay_info) -> str:
     if not pay_info:
-        return "（无支付信息，金额为 0）"
+        return "支付状态未知，请在订单页确认"
+    payment = pay_info.get("payment")
+    if pay_info.get("payment_required") is False:
+        return f"金额 {payment if payment is not None else '0'}，无需支付"
+    if pay_info.get("pay_url"):
+        return "支付链接已生成"
     if pay_info.get("alipay"):
         return "支付宝支付参数已生成"
     if pay_info.get("wechat"):
         return "微信支付参数已生成"
-    return "支付参数: " + str(pay_info.get("raw"))[:200]
+    if pay_info.get("pay_error"):
+        return f"需要支付，但支付信息生成失败: {pay_info['pay_error']}"
+    return "需要支付，请在奇谷米订单页继续支付"
 
 
 def main():
@@ -88,16 +95,26 @@ def main():
         date = params.get("reservation_date") or ""
         sku_name = params.get("sku_name") or ""
         num = params.get("num") or 1
-        pay_url = ""
-        if snap.get("pay_info") and snap["pay_info"].get("alipay"):
+        pay_info = snap.get("pay_info") or {}
+        payment_required = pay_info.get("payment_required") is not False
+        pay_url = pay_info.get("pay_url") or ""
+        pay_link_error = ""
+        if payment_required and not pay_url and pay_info.get("alipay"):
             try:
                 from qigumi_grabber.alipay import convert_alipay_to_h5
-                pay_url = convert_alipay_to_h5(snap["pay_info"]["alipay"])
-            except Exception:
+                pay_url = convert_alipay_to_h5(pay_info["alipay"])
+            except Exception as e:
+                pay_link_error = str(e)
                 pay_url = ""
         date_part = f"{date}的" if date else ""
-        print(f"手机号{phone}用户{nickname}已抢到{date_part}{sku_name}*{num}张，请及时打开链接{pay_url}链接支付！")
-        if pay_url and params.get("open_pay_page", True):
+        if not payment_required:
+            print(f"手机号{phone}用户{nickname}已抢到{date_part}{sku_name}*{num}张，金额为 0，无需支付。")
+        elif pay_url:
+            print(f"手机号{phone}用户{nickname}已抢到{date_part}{sku_name}*{num}张，请及时支付：{pay_url}")
+        else:
+            detail = pay_link_error or pay_info.get("pay_error") or "未返回支付链接"
+            print(f"手机号{phone}用户{nickname}已抢到{date_part}{sku_name}*{num}张，需要支付；请到奇谷米订单页继续支付（{detail}）。")
+        if payment_required and pay_url and params.get("open_pay_page", True):
             try:
                 webbrowser.open(pay_url)
                 print("[已尝试在浏览器中打开支付宝支付链接]")
@@ -114,7 +131,11 @@ def main():
                     print("[Server酱³] 发送失败: 全局 SendKey 未配置")
                 else:
                     title = f"抢到啦！{sku_name or '商品'}*{num}张"
-                    if pay_url:
+                    if not payment_required:
+                        desp = (f"手机号{phone}用户{nickname}已抢到{date_part}{sku_name}*{num}张\n\n"
+                                f"订单号: {snap.get('order_code', '')}\n\n"
+                                "（金额为0，无需支付）")
+                    elif pay_url:
                         desp = (f"手机号{phone}用户{nickname}已抢到{date_part}{sku_name}*{num}张\n\n"
                                 f"订单号: {snap.get('order_code', '')}\n\n"
                                 f"### [点击支付]({pay_url})\n\n"
@@ -122,11 +143,11 @@ def main():
                     else:
                         desp = (f"手机号{phone}用户{nickname}已抢到{date_part}{sku_name}*{num}张\n\n"
                                 f"订单号: {snap.get('order_code', '')}\n\n"
-                                f"（金额为0，无需支付）")
+                                "需要支付，但暂未生成支付链接；请到奇谷米订单页继续支付。")
                     r = send(sendkey, title, desp=desp,
                              short=f"订单号 {snap.get('order_code', '')}")
                     if r["ok"]:
-                        print("[Server酱³] 手机通知已发送（含支付链接）")
+                        print("[Server酱³] 手机通知已发送" + ("（含支付链接）" if pay_url else ""))
                     else:
                         print(f"[Server酱³] 发送失败: {r['msg']}")
             except Exception as e:

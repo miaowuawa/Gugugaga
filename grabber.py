@@ -441,35 +441,18 @@ class GrabTask:
     # ---------- 下单 ----------
 
     def _try_order(self, client, attempt: int) -> dict:
-        """单次下单尝试：commonDetail -> orderConfirm -> createOrder -> payOrder。"""
+        """回流模式的单次下单：orderConfirm -> createOrder -> payOrder。
+
+        SKU、场次、门店等参数在创建任务时已确定。重试时不再请求商品详情或
+        check* 库存接口，避免把“扫描库存”混入回流下单链路。
+        """
         p = self.params
         goods_id = int(p["goods_id"])
         sku_id = int(p["sku_id"])
         num = int(p.get("num") or 1)
-        result = {"ok": False, "stage": "refresh", "attempt": attempt}
+        result = {"ok": False, "stage": "order", "attempt": attempt}
 
-        # 1. 商品详情（刷新阶段）
-        try:
-            resp = client.get_goods_detail(goods_id)
-            detail = parse_resp(resp)
-        except Exception as e:
-            result["msg"] = f"获取商品详情失败: {e}"
-            return result
-        self._log("commonDetail", detail.get("code"), detail.get("msg") or "")
-        if not detail["ok"]:
-            result["msg"] = f"获取商品详情失败: code={detail['code']} msg={detail['msg']}"
-            return result
-        body = detail.get("body") or {}
-        gtype = classify_goods(body)
-        info = extract_goods_info(body)
-
-        # 售罄提示
-        sbs = info.get("sell_button_status")
-        if sbs in (4, 5):
-            result["msg"] = f"商品已售罄/结束 (sell_button_status={sbs})"
-            return result
-
-        # 2. 组装下单参数
+        # 所有运行时参数均来自任务配置/当前账号，不在回流时动态扫描或补全。
         store_id = int(p.get("store_id") or 0)
         venue_id = int(p.get("venue_id") or 0)
         address_id = int(p.get("address_id") or 0)
@@ -478,114 +461,7 @@ class GrabTask:
         buyer_ids = p.get("buyer_ids") or ""
         write_off_phone = p.get("write_off_phone") or ""
 
-        # 商品类型细分（逆向自 DataOrderGoodsModel）：
-        #   write_off_type: 0=普通商品 1=核销 2=预约 3=票务 4=券
-        # 所有非普通商品（write_off_type != 0）都需要核销手机号
-        write_off_type = body.get("write_off_type") or 0
-        is_common = gtype == "common" and write_off_type == 0
-
-        if gtype == "ticket":
-            # 票务：venue_id 必填；未指定时自动取第一个可售场馆
-            if not venue_id:
-                for v in info.get("venue_list") or []:
-                    if v.get("button_status") in (1, 3):
-                        venue_id = int(v["venue_id"])
-                        break
-            if not venue_id:
-                result["msg"] = "票务商品未找到可售场馆"
-                return result
-        elif gtype == "write_off":
-            # 核销/预约：store_id 必填；未指定时自动取第一个可售门店
-            if not store_id:
-                for s in info.get("store_list") or []:
-                    if s.get("button_status") == 3 and (s.get("surplus_store") or 0) > 0:
-                        store_id = int(s["store_id"])
-                        break
-            if not store_id:
-                result["msg"] = "核销商品未找到可售门店"
-                return result
-
-        # 非普通商品必须提供核销手机号
-        if not is_common and not write_off_phone:
-            result["msg"] = f"该商品类型(write_off_type={write_off_type})需要核销手机号"
-            return result
-
-        # 3. 按类型下单前校验
-        if gtype == "ticket":
-            # 票务类（write_off_type=3）：checkTicketGoods（venue_id + write_off_phone）
-            try:
-                resp = client.check_ticket_goods(
-                    goods_id, sku_id, num, venue_id=venue_id,
-                    write_off_phone=write_off_phone)
-                ck = parse_resp(resp)
-            except Exception as e:
-                ck = {"ok": False, "msg": str(e)}
-            self._log("checkTicket", ck.get("code"), ck.get("msg") or "")
-            if not ck["ok"]:
-                result["msg"] = f"库存校验失败: code={ck['code']} msg={ck['msg']}"
-                return result
-        elif gtype == "write_off":
-            if write_off_type == 1:
-                # 核销类：checkNormalReservationGoods（无 reservation_date）
-                try:
-                    resp = client.check_normal_reservation_goods(
-                        goods_id, num, store_id=store_id,
-                        write_off_phone=write_off_phone)
-                    ck = parse_resp(resp)
-                except Exception as e:
-                    ck = {"ok": False, "msg": str(e)}
-                self._log("checkNormal", ck.get("code"), ck.get("msg") or "")
-                if not ck["ok"]:
-                    result["msg"] = f"库存校验失败: code={ck['code']} msg={ck['msg']}"
-                    return result
-            else:
-                # 预约类（write_off_type=2）：场次与门店绑定，需先按门店拉取专属场次列表
-                if store_id and not reservation_quantum_id:
-                    try:
-                        resp = client.choose_reservation_goods_store(goods_id, store_id)
-                        cs = parse_resp(resp)
-                    except Exception as e:
-                        cs = {"ok": False, "msg": str(e)}
-                    self._log("chooseStore", cs.get("code"), cs.get("msg") or "")
-                    if cs["ok"]:
-                        for t in (cs.get("body") or {}).get("reservation_goods_time_list") or []:
-                            if not isinstance(t, dict):
-                                continue
-                            if not reservation_date:
-                                reservation_date = t.get("reservation_date") or ""
-                            for q in t.get("quantum_list") or []:
-                                if isinstance(q, dict) and q.get("quantum_status") in (1, 3):
-                                    reservation_quantum_id = int(q["id"])
-                                    break
-                            if reservation_quantum_id:
-                                break
-                try:
-                    resp = client.check_reservation_goods_v2(
-                        goods_id, num, store_id=store_id,
-                        reservation_date=reservation_date,
-                        reservation_quantum_id=reservation_quantum_id,
-                        write_off_phone=write_off_phone)
-                    ck = parse_resp(resp)
-                except Exception as e:
-                    ck = {"ok": False, "msg": str(e)}
-                self._log("checkV2", ck.get("code"), ck.get("msg") or "")
-                if not ck["ok"]:
-                    result["msg"] = f"库存校验失败: code={ck['code']} msg={ck['msg']}"
-                    return result
-        elif gtype == "voucher":
-            # 券类（write_off_type=4）：checkVoucherGoods
-            try:
-                resp = client.check_voucher_goods(
-                    goods_id, sku_id, num, write_off_phone=write_off_phone)
-                ck = parse_resp(resp)
-            except Exception as e:
-                ck = {"ok": False, "msg": str(e)}
-            self._log("checkVoucher", ck.get("code"), ck.get("msg") or "")
-            if not ck["ok"]:
-                result["msg"] = f"库存校验失败: code={ck['code']} msg={ck['msg']}"
-                return result
-
-        # 4. 实名制：同步选中购买人
+        # 实名购买人是账号状态，保留同步；它不是库存扫描。
         if buyer_ids:
             try:
                 resp = client.save_selected_buyer(goods_id, buyer_ids)
@@ -597,8 +473,7 @@ class GrabTask:
                 result["msg"] = f"同步购买人失败: {sel['msg']}"
                 return result
 
-        # 5. orderConfirm
-        result["stage"] = "order"
+        # 1. orderConfirm
         try:
             resp = client.order_confirm(
                 sku_id=sku_id, num=num, store_id=store_id, venue_id=venue_id,
@@ -612,12 +487,12 @@ class GrabTask:
         if not confirm["ok"]:
             result["msg"] = f"订单确认失败: code={confirm['code']} msg={confirm['msg']}"
             return result
-        payment = (confirm.get("body") or {}).get("payment")
-        if not payment:
+        payment = _extract_payment_amount(confirm.get("body") or {})
+        if payment is None:
             result["msg"] = "orderConfirm 未返回 payment"
             return result
 
-        # 6. createOrder
+        # 2. createOrder
         try:
             resp = client.create_order(
                 goods_id=goods_id, sku_id=sku_id, num=num, payment=payment,
@@ -638,25 +513,34 @@ class GrabTask:
             return result
         result["order_code"] = order_code
 
-        # 7. payOrder（金额 > 0 时发起支付，最多 3 次）
-        pay_info = None
-        try:
-            if float(payment or 0) > 0:
-                pay_type = p.get("pay_type") or "1"
-                for pay_attempt in range(3):
-                    if pay_attempt > 0 and self._sleep(0.8 + 0.4 * pay_attempt):
-                        break
-                    try:
-                        resp = client.pay_order(order_code, pay_type)
-                        pr = parse_resp(resp)
-                    except Exception as e:
-                        pr = {"ok": False, "msg": str(e)}
-                    self._log("payOrder", pr.get("code"), pr.get("msg") or "")
-                    if pr["ok"]:
-                        pay_info = _extract_pay_info(pr.get("body"), pay_type)
-                        break
-        except Exception:
-            pass
+        # 3. payOrder：即便 orderConfirm 的金额为 0，也请求一次以确认服务端
+        # 是否返回支付参数。此前只在 payment>0 时调用，导致需支付订单被误报为免费。
+        pay_type = p.get("pay_type") or "1"
+        payment_required = _payment_is_required(payment)
+        pay_info = {
+            "pay_type": pay_type,
+            "payment": payment,
+            "payment_required": payment_required,
+        }
+        last_pay_error = ""
+        for pay_attempt in range(3 if payment_required else 1):
+            if pay_attempt > 0 and self._sleep(0.8 + 0.4 * pay_attempt):
+                break
+            try:
+                resp = client.pay_order(order_code, pay_type)
+                pr = parse_resp(resp)
+            except Exception as e:
+                pr = {"ok": False, "msg": str(e)}
+            self._log("payOrder", pr.get("code"), pr.get("msg") or "")
+            if pr["ok"]:
+                pay_info.update(_extract_pay_info(pr.get("body"), pay_type))
+                # 服务端实际给出支付参数时优先认为需要支付，避免误报免费。
+                if pay_info.get("alipay") or pay_info.get("wechat") or pay_info.get("pay_url"):
+                    pay_info["payment_required"] = True
+                break
+            last_pay_error = str(pr.get("msg") or "payOrder 请求失败")
+        if last_pay_error and not pay_info.get("alipay") and not pay_info.get("wechat"):
+            pay_info["pay_error"] = last_pay_error
 
         result["ok"] = True
         result["pay_info"] = pay_info
@@ -714,8 +598,47 @@ def _extract_order_code(body) -> str:
         return ""
     order = body.get("order") or {}
     if isinstance(order, dict):
-        return order.get("order_code") or ""
+        order_code = order.get("order_code") or order.get("order_no")
+        if order_code:
+            return order_code
     return body.get("order_code") or body.get("order_no") or ""
+
+
+def _find_nested_value(data, keys, depth: int = 0):
+    """从支付接口可能嵌套的响应中取第一个非空字段。"""
+    if depth > 3:
+        return None
+    if isinstance(data, dict):
+        for key in keys:
+            value = data.get(key)
+            if value not in (None, ""):
+                return value
+        for value in data.values():
+            found = _find_nested_value(value, keys, depth + 1)
+            if found not in (None, ""):
+                return found
+    elif isinstance(data, list):
+        for value in data:
+            found = _find_nested_value(value, keys, depth + 1)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _extract_payment_amount(body):
+    """兼容不同版本 orderConfirm 的应付金额字段；0 也是有效金额。"""
+    return _find_nested_value(body, (
+        "payment", "pay_amount", "payAmount", "payment_amount", "paymentAmount",
+        "actual_payment", "actualPayment", "need_pay_amount", "needPayAmount",
+    ))
+
+
+def _payment_is_required(payment) -> bool:
+    """无法解析的金额按需支付处理，绝不把它误报为免费。"""
+    try:
+        return float(str(payment).replace("¥", "").replace(",", "").strip()) > 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _extract_pay_info(body, pay_type: str) -> dict:
@@ -727,18 +650,19 @@ def _extract_pay_info(body, pay_type: str) -> dict:
     info = {"pay_type": pay_type, "raw": body}
     if not isinstance(body, dict):
         return info
-    pay_params = body.get("payParams") or ""
+    pay_url = _find_nested_value(body, ("pay_url", "payUrl", "cashier_url", "cashierUrl"))
+    if isinstance(pay_url, str) and pay_url.startswith(("http://", "https://")):
+        info["pay_url"] = pay_url
+    pay_params = _find_nested_value(body, ("payParams", "pay_params", "pay_params_str")) or ""
     if pay_type == "1":  # 微信
         if pay_params:
             info["wechat"] = pay_params
-        elif body.get("prepay_id"):
-            info["wechat"] = f"prepay_id={body['prepay_id']}"
-        if not info.get("wechat"):
-            info["wechat"] = json.dumps(body, ensure_ascii=False)
+        elif _find_nested_value(body, ("prepay_id", "prepayId")):
+            info["wechat"] = f"prepay_id={_find_nested_value(body, ('prepay_id', 'prepayId'))}"
     else:  # 支付宝
-        for k in ("payParams", "alipay", "pay_info", "order_str"):
-            v = body.get(k)
-            if v:
-                info["alipay"] = v
-                break
+        alipay = _find_nested_value(body, (
+            "payParams", "pay_params", "alipay", "alipay_sdk", "pay_info", "order_str",
+        ))
+        if alipay:
+            info["alipay"] = alipay
     return info
